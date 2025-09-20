@@ -45,7 +45,7 @@ optimizer = {}
 data = dict(
     workers_per_gpu=4,
     val=dict(
-        num_test_images=25_000, # TODO: change to 50_000 for final eval
+        num_test_images=2_000, # TODO: change to 50_000 for final eval
         type='ImageNet',
         test_mode=True),
     val_dataloader=dict(samples_per_gpu=60),
@@ -62,7 +62,7 @@ methods = dict(
     gmode2=dict(
         output_mode='mean',
         sampler='FlowEulerODE',
-        order=2),
+        order=1),
     # gmsde2=dict(
     #     output_mode='sample',
     #     sampler='GMFlowSDE',
@@ -71,7 +71,7 @@ methods = dict(
 
 evaluation = []
 
-for step, substep in [(32, 4)]:  # (8, 16)
+for step, substep in [(8, 1)]:  # (8, 16)
     for method_name, method_config in methods.items():
         for guidance_scale in guidance_scales:
             test_cfg_override = dict(

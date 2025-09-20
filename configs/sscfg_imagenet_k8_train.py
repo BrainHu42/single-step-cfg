@@ -153,7 +153,7 @@ runner = dict(
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
 load_from = None
-resume_from = f'checkpoints/{name}/iter_106000.pth'  # resume by default
+resume_from = f'checkpoints/{name}/iter_120000.pth'  # resume by default
 workflow = [('train', save_interval)]
 use_ddp_wrapper = True
 find_unused_parameters = False

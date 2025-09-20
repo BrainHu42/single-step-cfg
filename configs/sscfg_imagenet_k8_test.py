@@ -48,7 +48,7 @@ optimizer = {}
 data = dict(
     workers_per_gpu=4,
     val=dict(
-        num_test_images=1200, # TODO: change to 50_000 for final eval
+        num_test_images=2000, # TODO: change to 50_000 for final eval
         type='ImageNet',
         test_mode=True),
     val_dataloader=dict(samples_per_gpu=60),
@@ -59,8 +59,8 @@ lr_config = dict()
 checkpoint_config = dict()
 
 
-guidance_scales = [0.1, 0.2, 0.3]
-temperatures = [(0.4, 2), (0.4, 3), (0.3, 2), (0.3, 3)]
+guidance_scales = [0.08]
+temperatures = [0.8, 0.7, 0.6]
 
 methods = dict(
     gmode1=dict(
@@ -78,13 +78,14 @@ evaluation = []
 for step, substep in [(8, 1), (32, 1)]:
     for method_name, method_config in methods.items():
         for guidance_scale in guidance_scales:
-            for t_low, t_high in temperatures:
-                temp_str = f"{t_low:.2f}-{t_high:.2f}"
+            for temp in temperatures:
+                temp_str = str(temp) # f"{t_low:.2f}-{t_high:.2f}"
                 test_cfg_override = dict(
                     orthogonal_guidance=0,
                     guidance_scale=guidance_scale,
-                    T_low=t_low,
-                    T_high=t_high,
+                    temperature=temp,
+                    # T_low=t_low,
+                    # T_high=t_high,
                     num_timesteps=step)
                 if 'gmode' in method_name:
                     test_cfg_override.update(num_substeps=substep)
@@ -136,4 +137,4 @@ opencv_num_threads = 0
 mp_start_method = 'fork'
 
 
-# python test.py configs/sscfg_imagenet_k8_test.py checkpoints/sscfg_imagenet_k8_finetune/latest.pth --deterministic --gpu-ids 0
+# python test.py configs/sscfg_imagenet_k8_test.py checkpoints/sscfg_imagenet_k8_train/iter_120000.pth --deterministic --gpu-ids 0

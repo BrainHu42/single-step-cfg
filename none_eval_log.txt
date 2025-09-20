@@ -1,0 +1,20 @@
+2025-09-17 04:46:16,536 - mmgen - INFO - evaluation
+2025-09-17 04:46:16,536 - mmgen - INFO - Set random seed to 2021, deterministic: True, use_rank_shift: False
+2025-09-17 04:46:20,567 - mmgen - INFO - load checkpoint from local path: /workspace/gmflow_imagenet_k8_ema/transformer/diffusion_pytorch_model.bf16.pt
+2025-09-17 04:46:22,829 - mmgen - INFO - load checkpoint from local path: /workspace/gmflow_imagenet_k8_ema/spectrum_net/diffusion_pytorch_model.bf16.pt
+2025-09-17 05:03:13,794 - mmgen - INFO - evaluation
+2025-09-17 05:03:13,794 - mmgen - INFO - Set random seed to 2021, deterministic: True, use_rank_shift: False
+2025-09-17 05:03:17,840 - mmgen - INFO - load checkpoint from local path: /workspace/gmflow_imagenet_k8_ema/transformer/diffusion_pytorch_model.bf16.pt
+2025-09-17 05:03:21,098 - mmgen - INFO - load checkpoint from local path: /workspace/gmflow_imagenet_k8_ema/spectrum_net/diffusion_pytorch_model.bf16.pt
+2025-09-17 05:03:21,715 - mmgen - INFO - Set random seed to 2021, deterministic: True, use_rank_shift: False
+2025-09-17 05:03:21,721 - mmgen - INFO - Sample 25000 fake scenes for evaluation
+2025-09-17 05:05:37,785 - mmgen - INFO - evaluation
+2025-09-17 05:05:37,786 - mmgen - INFO - Set random seed to 2021, deterministic: True, use_rank_shift: False
+2025-09-17 05:05:41,846 - mmgen - INFO - load checkpoint from local path: /workspace/gmflow_imagenet_k8_ema/transformer/diffusion_pytorch_model.bf16.pt
+2025-09-17 05:05:44,511 - mmgen - INFO - load checkpoint from local path: /workspace/gmflow_imagenet_k8_ema/spectrum_net/diffusion_pytorch_model.bf16.pt
+2025-09-17 05:05:45,027 - mmgen - INFO - Set random seed to 2021, deterministic: True, use_rank_shift: False
+2025-09-17 05:05:45,033 - mmgen - INFO - Sample 25000 fake scenes for evaluation
+2025-09-17 05:23:37,252 - mmgen - INFO - gmode2_g0.47_step8_fid = 18.608430246345193
+2025-09-17 05:23:37,519 - mmgen - INFO - gmode2_g0.47_step8_precision = 0.9467999935150146
+2025-09-17 05:23:37,533 - mmgen - INFO - gmode2_g0.47_step8_recall = 0.2215999960899353
+2025-09-17 05:23:37,538 - mmgen - INFO - gmode2_g0.47_step8_is = 439.18365478515625
