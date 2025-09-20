@@ -6,7 +6,7 @@ import torch
 import diffusers
 import mmcv
 
-from typing import Optional
+from typing import Optional, Tuple, Dict
 from copy import deepcopy
 from mmgen.models.architectures.common import get_module_device
 from mmgen.models.builder import MODULES, build_module
@@ -128,6 +128,113 @@ def temperature_guidance_jit(
         var_out = total_var
 
     gaussian_output = dict(mean=overall_mean + bias, var=var_out)
+    return gaussian_output, bias, avg_var
+
+
+@torch.no_grad()
+def calculate_direct_guidance(
+    gm: Dict[str, torch.Tensor],
+    T: float,                                   # temperature for CONDITIONAL weights only
+    total_var: torch.Tensor,                    # (B,*,C,H,W) fused variance
+    eps: float = 1e-8,
+    orthogonal: float = 0.0,                    # 0 disables; 1 removes full parallel component
+    orthogonal_axis: Optional[torch.Tensor] = None,
+    guidance_scale: float = 0.0,                # if >0, normalize+scale bias; var_out = total_var*(1-g^2)
+) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+    """
+    Direct guidance with temperature on conditional weights only:
+        raw_bias = E_{p_cond, T}[x] - E_{p_uncond}[x]
+
+    Shapes (match temperature_guidance_jit convention):
+      - gm["means"]              : (B, *, G, C, H, W)
+      - gm["logweights"]         : (B, *, G, 1, H, W) or broadcastable      # conditional
+      - gm["uncond_logweights"]  : same rule as above                        # unconditional
+      - total_var                : (B, *, C, H, W)
+
+    Returns:
+      gaussian_output: dict(mean=(B,*,C,H,W), var=(B,*,C,H,W))
+      bias          : (B,*,C,H,W) final applied bias (after orthogonal + scaling)
+      avg_var       : (B,*,1,1,1)
+    """
+    means: torch.Tensor = gm["means"]  # (B,*,G,C,H,W)
+    lw_cond: torch.Tensor = gm["logweights"]
+    if "uncond_logweights" not in gm:
+        raise KeyError("gm must contain 'uncond_logweights' to compute unconditional mean.")
+    lw_uncond: torch.Tensor = gm["uncond_logweights"]
+
+    if means.dim() < 5:
+        raise ValueError(f"'means' must be at least 5D (B,*,G,C,H,W). Got {tuple(means.shape)}")
+    if total_var.dim() != means.dim() - 1:
+        raise ValueError(f"'total_var' must be (B,*,C,H,W). Got {tuple(total_var.shape)}")
+
+    mix_dim = means.dim() - 4  # == -4 for (..., G, C, H, W)
+
+    def _normalize_logweights_shape(lw: torch.Tensor, means: torch.Tensor) -> torch.Tensor:
+        if lw.size(mix_dim) != means.size(mix_dim):
+            raise ValueError(
+                f"logweights must have same G as means on mix_dim={mix_dim}: "
+                f"{lw.size(mix_dim)} vs {means.size(mix_dim)}"
+            )
+        while lw.dim() < means.dim():
+            lw = lw.unsqueeze(-1)
+        # ensure broadcastability
+        for d in range(min(lw.dim(), means.dim())):
+            if d == mix_dim:
+                continue
+            if lw.size(d) not in (1, means.size(d)):
+                raise ValueError(
+                    f"logweights not broadcastable to means at dim {d}: "
+                    f"{lw.size(d)} vs {means.size(d)}"
+                )
+        return lw
+
+    lw_cond = _normalize_logweights_shape(lw_cond, means)
+    lw_uncond = _normalize_logweights_shape(lw_uncond, means)
+
+    def _weights_from_logweights(lw: torch.Tensor, T: float) -> torch.Tensor:
+        lw0 = lw - torch.logsumexp(lw, dim=mix_dim, keepdim=True)
+        T = float(T) if float(T) > eps else eps
+        lwT = lw0 / T
+        lwT = lwT - torch.logsumexp(lwT, dim=mix_dim, keepdim=True)
+        return torch.exp(lwT)
+
+    # Means under conditional (tempered) and unconditional (untempered) weights
+    w_cond_T = _weights_from_logweights(lw_cond, T=T)
+    w_uncond = _weights_from_logweights(lw_uncond, T=1.0)
+
+    mean_cond_T = (means * w_cond_T).sum(dim=mix_dim)      # (B,*,C,H,W)
+    mean_uncond = (means * w_uncond).sum(dim=mix_dim)      # (B,*,C,H,W)
+
+    # Raw bias (guidance)
+    bias = mean_cond_T - mean_uncond                        # (B,*,C,H,W)
+
+    # Optional orthogonal projection (project out component along axis)
+    if orthogonal > 0.0:
+        axis = mean_cond_T if (orthogonal_axis is None) else orthogonal_axis
+        if axis.shape != bias.shape:
+            axis = axis.expand_as(bias)
+        reduce_dims = (-3, -2, -1) if bias.dim() >= 3 else (-1,)
+        num = (bias * axis).mean(dim=reduce_dims, keepdim=True)
+        den = (axis * axis).mean(dim=reduce_dims, keepdim=True).clamp(min=1e-6)
+        proj = (num / den) * axis
+        bias = bias - proj.mul(orthogonal)
+
+    # Match temperature_guidance_jit normalization/variance behavior
+    bias_power = (bias * bias).mean(dim=(-3, -2, -1), keepdim=True)      # (B,*,1,1,1)
+    avg_var = total_var.mean(dim=(-3, -2, -1), keepdim=True)             # (B,*,1,1,1)
+
+    if guidance_scale > 0.0:
+        # Normalize bias magnitude to variance scale and apply guidance_scale
+        bias = bias * ((avg_var / bias_power.clamp(min=1e-6)).sqrt() * guidance_scale)
+        var_out = total_var * (1.0 - guidance_scale * guidance_scale)
+    else:
+        var_out = total_var
+
+    # Choose a baseline mean + add bias to form the output mean.
+    # Using mean_uncond as the baseline ensures: baseline + raw_bias = mean_cond_T.
+    # After projection/normalization, this matches the semantics of temperature_guidance_jit.
+    gaussian_output = dict(mean=mean_cond_T + bias, var=var_out)
+
     return gaussian_output, bias, avg_var
 
 
@@ -827,8 +934,9 @@ class GMFlowSSCFG(GMFlow):
         num_timesteps = cfg.get('num_timesteps', self.num_timesteps)
         num_substeps = cfg.get('num_substeps', 1)
         orthogonal_guidance = cfg.get('orthogonal_guidance', 1.0)
-        T_low = cfg.get('temperature_low', cfg.get('T_low', 0.2))
-        T_high = cfg.get('temperature_high', cfg.get('T_high', 4.0))
+        temperature = cfg.get("temperature", 1.0)
+        # T_low = cfg.get('temperature_low', cfg.get('T_low', 0.2))
+        # T_high = cfg.get('temperature_high', cfg.get('T_high', 4.0))
         scale_by_tau = cfg.get('temperature_scale_by_tau', True)
         save_intermediate = cfg.get('save_intermediate', False)
         order = cfg.get('order', 1)
@@ -868,15 +976,9 @@ class GMFlowSSCFG(GMFlow):
                 gaussian_cond_u['var'] = gaussian_cond_u['var'].mean(dim=(-1, -2), keepdim=True)
 
                 # Temperature guidance in u-space
-                gaussian_output_u, cfg_bias_u, avg_var_u = temperature_guidance_jit(
-                    gm_cond_u['means'], gm_cond_u['logweights'], gaussian_cond_u['var'],
-                    T_low=T_low, T_high=T_high, scale_by_tau=scale_by_tau,
-                    guidance_scale=guidance_scale)
-
-                # Fuse guided iso-Gaussian with conditional GM (still u-space)
-                gm_output_u = gm_mul_iso_gaussian(
-                    gm_cond_u, iso_gaussian_mul_iso_gaussian(gaussian_output_u, gaussian_cond_u, 1, -1), 1, 1
-                )[0]
+                gm_output_u, cfg_bias_u, avg_var_u = calculate_direct_guidance(
+                    gm_cond_u, gaussian_cond_u['var'],
+                    T=temperature, guidance_scale=guidance_scale)
 
                 # Convert guided result and auxiliaries to x0-space for downstream
                 gm_output = self.u_to_x_0(gm_output_u, x_t, t)
