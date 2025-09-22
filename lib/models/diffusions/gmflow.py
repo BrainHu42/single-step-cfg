@@ -406,6 +406,7 @@ class GMFlowMixin:
             gm_means, gm_vars, gm_logweights,
             eps)
 
+
     def reverse_transition(self, denoising_output, x_t_high, t_low, t_high, eps=1e-6, prediction_type='u'):
         if isinstance(denoising_output, dict):
             x_t_high = x_t_high.unsqueeze(-4)
@@ -454,9 +455,7 @@ class GMFlowMixin:
             return dict(
                 means=means_x_t_low,
                 logstds=logstds_x_t_low,
-                logweights=denoising_output['logweights'],
-                uncond_logweights=denoising_output['uncond_logweights']
-            )
+                logweights=denoising_output['logweights'])
 
         else:  # sample mode
             c3_sqrt = beta_over_sigma_sq ** 0.5 * sigma_to
@@ -840,6 +839,70 @@ class GMFlow(GaussianFlow, GMFlowMixin):
 @MODULES.register_module()
 class GMFlowSSCFG(GMFlow):
     
+    def reverse_transition(self, denoising_output, x_t_high, t_low, t_high, eps=1e-6, prediction_type='u'):
+        if isinstance(denoising_output, dict):
+            x_t_high = x_t_high.unsqueeze(-4)
+
+        bs = x_t_high.size(0)
+        if not isinstance(t_low, torch.Tensor):
+            t_low = torch.tensor(t_low, device=x_t_high.device)
+        if not isinstance(t_high, torch.Tensor):
+            t_high = torch.tensor(t_high, device=x_t_high.device)
+        if t_low.dim() == 0:
+            t_low = t_low.expand(bs)
+        if t_high.dim() == 0:
+            t_high = t_high.expand(bs)
+        t_low = t_low.reshape(*t_low.size(), *((x_t_high.dim() - t_low.dim()) * [1]))
+        t_high = t_high.reshape(*t_high.size(), *((x_t_high.dim() - t_high.dim()) * [1]))
+
+        sigma = t_high / self.num_timesteps
+        sigma_to = t_low / self.num_timesteps
+        alpha = 1 - sigma
+        alpha_to = 1 - sigma_to
+
+        sigma_to_over_sigma = sigma_to / sigma.clamp(min=eps)
+        alpha_over_alpha_to = alpha / alpha_to.clamp(min=eps)
+        beta_over_sigma_sq = 1 - (sigma_to_over_sigma * alpha_over_alpha_to) ** 2
+
+        c1 = sigma_to_over_sigma ** 2 * alpha_over_alpha_to
+        c2 = beta_over_sigma_sq * alpha_to
+
+        if isinstance(denoising_output, dict):
+            c3 = beta_over_sigma_sq * sigma_to ** 2
+            if prediction_type == 'u':
+                means_x_0 = x_t_high - sigma * denoising_output['means']
+                logstds_x_t_low = torch.logaddexp(
+                    (denoising_output['logstds'] + torch.log((sigma * c2).clamp(min=eps))) * 2,
+                    torch.log(c3.clamp(min=eps))
+                ) / 2
+            elif prediction_type == 'x0':
+                means_x_0 = denoising_output['means']
+                logstds_x_t_low = torch.logaddexp(
+                    (denoising_output['logstds'] + torch.log(c2.clamp(min=eps))) * 2,
+                    torch.log(c3.clamp(min=eps))
+                ) / 2
+            else:
+                raise ValueError('Invalid prediction_type.')
+            means_x_t_low = c1 * x_t_high + c2 * means_x_0
+            return dict(
+                means=means_x_t_low,
+                logstds=logstds_x_t_low,
+                logweights=denoising_output['logweights'],
+                uncond_logweights=denoising_output['uncond_logweights']
+            )
+
+        else:  # sample mode
+            c3_sqrt = beta_over_sigma_sq ** 0.5 * sigma_to
+            noise = torch.randn_like(denoising_output)
+            if prediction_type == 'u':
+                x_0 = x_t_high - sigma * denoising_output
+            elif prediction_type == 'x0':
+                x_0 = denoising_output
+            else:
+                raise ValueError('Invalid prediction_type.')
+            x_t_low = c1 * x_t_high + c2 * x_0 + c3_sqrt * noise
+            return x_t_low
+    
     def loss(self, denoising_output, x_t_low, x_t_high, t_low, t_high, x_t_low_matrix, x0_bank):
         """
         GMFlow transition loss.
@@ -903,141 +966,141 @@ class GMFlowSSCFG(GMFlow):
 
         return loss, log_vars    
 
-    # def forward_test(
-    #         self, x_0=None, noise=None, guidance_scale=0.0,
-    #         test_cfg_override=dict(), show_pbar=False, **kwargs):
-    #     x_t = torch.randn_like(x_0) if noise is None else noise
-    #     num_batches = x_t.size(0)
-    #     ori_dtype = x_t.dtype
-    #     x_t = x_t.float()
+    def forward_test(
+            self, x_0=None, noise=None, guidance_scale=0.0,
+            test_cfg_override=dict(), show_pbar=False, **kwargs):
+        x_t = torch.randn_like(x_0) if noise is None else noise
+        num_batches = x_t.size(0)
+        ori_dtype = x_t.dtype
+        x_t = x_t.float()
 
-    #     cfg = deepcopy(self.test_cfg)
-    #     cfg.update(test_cfg_override)
+        cfg = deepcopy(self.test_cfg)
+        cfg.update(test_cfg_override)
 
-    #     output_mode = cfg.get('output_mode', 'mean')
-    #     assert output_mode in ['mean', 'sample']
+        output_mode = cfg.get('output_mode', 'mean')
+        assert output_mode in ['mean', 'sample']
 
-    #     sampler = cfg['sampler']
-    #     sampler_class = getattr(diffusers.schedulers, sampler + 'Scheduler', None)
-    #     if sampler_class is None:
-    #         sampler_class = getattr(schedulers, sampler + 'Scheduler', None)
-    #     if sampler_class is None:
-    #         raise AttributeError(f'Cannot find sampler [{sampler}].')
+        sampler = cfg['sampler']
+        sampler_class = getattr(diffusers.schedulers, sampler + 'Scheduler', None)
+        if sampler_class is None:
+            sampler_class = getattr(schedulers, sampler + 'Scheduler', None)
+        if sampler_class is None:
+            raise AttributeError(f'Cannot find sampler [{sampler}].')
 
-    #     sampler_kwargs = cfg.get('sampler_kwargs', {})
-    #     signatures = inspect.signature(sampler_class).parameters.keys()
-    #     if 'shift' in signatures and 'shift' not in sampler_kwargs:
-    #         sampler_kwargs['shift'] = cfg.get('shift', self.timestep_sampler.shift)
-    #     if 'output_mode' in signatures:
-    #         sampler_kwargs['output_mode'] = output_mode
-    #     sampler = sampler_class(self.num_timesteps, **sampler_kwargs)
+        sampler_kwargs = cfg.get('sampler_kwargs', {})
+        signatures = inspect.signature(sampler_class).parameters.keys()
+        if 'shift' in signatures and 'shift' not in sampler_kwargs:
+            sampler_kwargs['shift'] = cfg.get('shift', self.timestep_sampler.shift)
+        if 'output_mode' in signatures:
+            sampler_kwargs['output_mode'] = output_mode
+        sampler = sampler_class(self.num_timesteps, **sampler_kwargs)
 
-    #     num_timesteps = cfg.get('num_timesteps', self.num_timesteps)
-    #     num_substeps = cfg.get('num_substeps', 1)
-    #     orthogonal_guidance = cfg.get('orthogonal_guidance', 1.0)
-    #     temperature = cfg.get("temperature", 1.0)
-    #     # T_low = cfg.get('temperature_low', cfg.get('T_low', 0.2))
-    #     # T_high = cfg.get('temperature_high', cfg.get('T_high', 4.0))
-    #     # scale_by_tau = cfg.get('temperature_scale_by_tau', True)
-    #     save_intermediate = cfg.get('save_intermediate', False)
-    #     order = cfg.get('order', 1)
-    #     gm2_coefs = cfg.get('gm2_coefs', [0.005, 1.0])
-    #     gm2_correction_steps = cfg.get('gm2_correction_steps', 0)
+        num_timesteps = cfg.get('num_timesteps', self.num_timesteps)
+        num_substeps = cfg.get('num_substeps', 1)
+        orthogonal_guidance = cfg.get('orthogonal_guidance', 1.0)
+        temperature = cfg.get("temperature", 1.0)
+        # T_low = cfg.get('temperature_low', cfg.get('T_low', 0.2))
+        # T_high = cfg.get('temperature_high', cfg.get('T_high', 4.0))
+        # scale_by_tau = cfg.get('temperature_scale_by_tau', True)
+        save_intermediate = cfg.get('save_intermediate', False)
+        order = cfg.get('order', 1)
+        gm2_coefs = cfg.get('gm2_coefs', [0.005, 1.0])
+        gm2_correction_steps = cfg.get('gm2_correction_steps', 0)
 
-    #     sampler.set_timesteps(num_timesteps * num_substeps, device=x_t.device)
-    #     timesteps = sampler.timesteps
-    #     self.intermediate_x_t = []
-    #     self.intermediate_x_0 = []
-    #     self.intermediate_gm_x_0 = []
-    #     self.intermediate_gm_trans = []
-    #     self.intermediate_t = []
-    #     assert order in [1, 2]
+        sampler.set_timesteps(num_timesteps * num_substeps, device=x_t.device)
+        timesteps = sampler.timesteps
+        self.intermediate_x_t = []
+        self.intermediate_x_0 = []
+        self.intermediate_gm_x_0 = []
+        self.intermediate_gm_trans = []
+        self.intermediate_t = []
+        assert order in [1, 2]
 
-    #     if show_pbar:
-    #         pbar = mmcv.ProgressBar(num_timesteps)
+        if show_pbar:
+            pbar = mmcv.ProgressBar(num_timesteps)
 
-    #     # ========== Main sampling loop ==========
-    #     self.init_gm_cache()
+        # ========== Main sampling loop ==========
+        self.init_gm_cache()
 
-    #     for timestep_id in range(num_timesteps):
-    #         t = timesteps[timestep_id * num_substeps]
+        for timestep_id in range(num_timesteps):
+            t = timesteps[timestep_id * num_substeps]
 
-    #         if save_intermediate:
-    #             self.intermediate_x_t.append(x_t)
-    #             self.intermediate_t.append(t)
+            if save_intermediate:
+                self.intermediate_x_t.append(x_t)
+                self.intermediate_t.append(t)
 
-    #         # Only conditional prediction is required (keep in u-space for guidance)
-    #         gm_output = self.pred(x_t, t, **kwargs)
-    #         assert isinstance(gm_output, dict)
-    #         gm_output = self.u_to_x_0(gm_output, x_t, t)
+            # Only conditional prediction is required (keep in u-space for guidance)
+            gm_output = self.pred(x_t, t, **kwargs)
+            assert isinstance(gm_output, dict)
+            gm_output = self.u_to_x_0(gm_output, x_t, t)
 
-    #         if guidance_scale > 0.0:
-    #             # Base conditional GM and its iso-Gaussian in u-space
-    #             gm_cond = gm_output
-    #             gaussian_cond = gm_to_iso_gaussian(gm_cond)[0]
-    #             gaussian_cond['var'] = gaussian_cond['var'].mean(dim=(-1, -2), keepdim=True)
+            if guidance_scale > 0.0:
+                # Base conditional GM and its iso-Gaussian in u-space
+                gm_cond = gm_output
+                gaussian_cond = gm_to_iso_gaussian(gm_cond)[0]
+                gaussian_cond['var'] = gaussian_cond['var'].mean(dim=(-1, -2), keepdim=True)
 
-    #             # Temperature guidance in u-space
-    #             gaussian_output, cfg_bias, avg_var = calculate_direct_guidance(
-    #                 gm=gm_cond,
-    #                 T=temperature,
-    #                 total_var=gaussian_cond['var'],
-    #                 orthogonal=orthogonal_guidance,
-    #                 guidance_scale=guidance_scale,
-    #             )
-    #             gm_output = gm_mul_iso_gaussian(
-    #                 gm_cond, iso_gaussian_mul_iso_gaussian(gaussian_output, gaussian_cond, 1, -1),
-    #                 1, 1)[0]
-    #         else:
-    #             # No guidance: convert once and continue in x0-space
-    #             gm_output = self.u_to_x_0(gm_output, x_t, t)
-    #             gaussian_output = gm_to_iso_gaussian(gm_output)[0]
-    #             gm_cond = gaussian_cond = avg_var = cfg_bias = None
+                # Temperature guidance in u-space
+                gaussian_output, cfg_bias, avg_var = calculate_direct_guidance(
+                    gm=gm_cond,
+                    T=temperature,
+                    total_var=gaussian_cond['var'],
+                    orthogonal=orthogonal_guidance,
+                    guidance_scale=guidance_scale,
+                )
+                gm_output = gm_mul_iso_gaussian(
+                    gm_cond, iso_gaussian_mul_iso_gaussian(gaussian_output, gaussian_cond, 1, -1),
+                    1, 1)[0]
+            else:
+                # No guidance: convert once and continue in x0-space
+                gm_output = self.u_to_x_0(gm_output, x_t, t)
+                gaussian_output = gm_to_iso_gaussian(gm_output)[0]
+                gm_cond = gaussian_cond = avg_var = cfg_bias = None
 
-    #         # ========== 2nd order GM ==========
-    #         if order == 2:
-    #             if timestep_id < num_timesteps - 1:
-    #                 h = t - timesteps[(timestep_id + 1) * num_substeps]
-    #             else:
-    #                 h = t
-    #             gm_output, gaussian_output = self.gm_2nd_order(
-    #                 gm_output, gaussian_output, x_t, t, h,
-    #                 guidance_scale, gm_cond, gaussian_cond, avg_var, cfg_bias, ca=gm2_coefs[0], cb=gm2_coefs[1],
-    #                 gm2_correction_steps=gm2_correction_steps)
+            # ========== 2nd order GM ==========
+            if order == 2:
+                if timestep_id < num_timesteps - 1:
+                    h = t - timesteps[(timestep_id + 1) * num_substeps]
+                else:
+                    h = t
+                gm_output, gaussian_output = self.gm_2nd_order(
+                    gm_output, gaussian_output, x_t, t, h,
+                    guidance_scale, gm_cond, gaussian_cond, avg_var, cfg_bias, ca=gm2_coefs[0], cb=gm2_coefs[1],
+                    gm2_correction_steps=gm2_correction_steps)
 
-    #         if save_intermediate:
-    #             self.intermediate_gm_x_0.append(gm_output)
-    #             if timestep_id < num_timesteps - 1:
-    #                 t_next = timesteps[(timestep_id + 1) * num_substeps]
-    #             else:
-    #                 t_next = 0
-    #             gm_trans = self.reverse_transition(gm_output, x_t, t_next, t, prediction_type='x0')
-    #             self.intermediate_gm_trans.append(gm_trans)
+            if save_intermediate:
+                self.intermediate_gm_x_0.append(gm_output)
+                if timestep_id < num_timesteps - 1:
+                    t_next = timesteps[(timestep_id + 1) * num_substeps]
+                else:
+                    t_next = 0
+                gm_trans = self.reverse_transition(gm_output, x_t, t_next, t, prediction_type='x0')
+                self.intermediate_gm_trans.append(gm_trans)
 
-    #         # ========== GM SDE step or GM ODE substeps ==========
-    #         x_t_base = x_t
-    #         t_base = t
-    #         for substep_id in range(num_substeps):
-    #             if substep_id == 0:
-    #                 if self.spectrum_net is not None and output_mode == 'sample':
-    #                     power_spectrum = self.spectrum_net(gaussian_output)
-    #                 else:
-    #                     power_spectrum = None
-    #                 model_output = self.gm_to_model_output(gm_output, output_mode, power_spectrum=power_spectrum)
-    #             else:
-    #                 assert output_mode == 'mean'
-    #                 t = timesteps[timestep_id * num_substeps + substep_id]
-    #                 model_output = self.denoising_gm_convert_to_mean(
-    #                     gm_output, x_t, x_t_base, t, t_base, prediction_type='x0')
-    #             x_t = sampler.step(model_output, t, x_t, return_dict=False, prediction_type='x0')[0]
+            # ========== GM SDE step or GM ODE substeps ==========
+            x_t_base = x_t
+            t_base = t
+            for substep_id in range(num_substeps):
+                if substep_id == 0:
+                    if self.spectrum_net is not None and output_mode == 'sample':
+                        power_spectrum = self.spectrum_net(gaussian_output)
+                    else:
+                        power_spectrum = None
+                    model_output = self.gm_to_model_output(gm_output, output_mode, power_spectrum=power_spectrum)
+                else:
+                    assert output_mode == 'mean'
+                    t = timesteps[timestep_id * num_substeps + substep_id]
+                    model_output = self.denoising_gm_convert_to_mean(
+                        gm_output, x_t, x_t_base, t, t_base, prediction_type='x0')
+                x_t = sampler.step(model_output, t, x_t, return_dict=False, prediction_type='x0')[0]
 
-    #         if save_intermediate:
-    #             self.intermediate_x_0.append(model_output)
+            if save_intermediate:
+                self.intermediate_x_0.append(model_output)
 
-    #         if show_pbar:
-    #             pbar.update()
+            if show_pbar:
+                pbar.update()
 
-    #     if show_pbar:
-    #         sys.stdout.write('\n')
+        if show_pbar:
+            sys.stdout.write('\n')
 
-    #     return x_t.to(ori_dtype)
+        return x_t.to(ori_dtype)
