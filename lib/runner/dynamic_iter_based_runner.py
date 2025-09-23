@@ -79,12 +79,28 @@ class DynamicIterBasedRunnerMod(DynamicIterBasedRunner):
         self._iter = checkpoint['meta']['iter']
         self._inner_iter = checkpoint['meta']['iter']
         if 'optimizer' in checkpoint and resume_optimizer:
+            optimizer_state = checkpoint['optimizer']
             if isinstance(self.optimizer, Optimizer):
-                self.optimizer.load_state_dict(checkpoint['optimizer'])
+                try:
+                    self.optimizer.load_state_dict(optimizer_state)
+                except (ValueError, KeyError, RuntimeError) as err:
+                    self.logger.warning(
+                        'optimizer state_dict mismatch detected during resume: '
+                        f'{err}. Proceeding without loading optimizer state.')
             elif isinstance(self.optimizer, dict):
                 for k in self.optimizer.keys():
-                    self.optimizer[k].load_state_dict(
-                        checkpoint['optimizer'][k])
+                    if k not in optimizer_state:
+                        self.logger.warning(
+                            f'skip loading optimizer state for "{k}"; '
+                            'entry missing in checkpoint.')
+                        continue
+                    try:
+                        self.optimizer[k].load_state_dict(optimizer_state[k])
+                    except (ValueError, KeyError, RuntimeError) as err:
+                        self.logger.warning(
+                            'optimizer state_dict mismatch detected for '
+                            f'"{k}" during resume: {err}. '
+                            'Proceeding without loading this optimizer state.')
             else:
                 raise TypeError(
                     'Optimizer should be dict or torch.optim.Optimizer '
