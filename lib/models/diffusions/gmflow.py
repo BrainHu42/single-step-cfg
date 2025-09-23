@@ -839,11 +839,39 @@ class GMFlow(GaussianFlow, GMFlowMixin):
 @MODULES.register_module()
 class GMFlowSSCFG(GMFlow):
     
-    def reverse_transition(self, denoising_output, x_t_high, t_low, t_high, eps=1e-6, prediction_type='u'):
+    def reverse_transition(
+            self,
+            denoising_output,   # expects dict with cond_* and uncond_* keys
+            x_t_high,
+            t_low,
+            t_high,
+            eps=1e-6,
+            prediction_type='u',   # 'u' or 'x0'
+        ):
+        """
+        Reverse transition for GM parameterization using split heads.
+
+        Input (from model.forward):
+            denoising_output: {
+                'cond_means','cond_logweights','cond_logstds',
+                'uncond_means','uncond_logweights','uncond_logstds'
+            }
+            x_t_high: [B, C, H, W]
+            t_low, t_high: scalar or [B]
+
+        Returns:
+            {
+            'cond_means','cond_logstds','cond_logweights',
+            'uncond_means','uncond_logstds','uncond_logweights'
+            }, where *_means/*_logstds are for x_{t_low}.
+        """
         if isinstance(denoising_output, dict):
+            # make x compatible with [B, G, C, H, W]
             x_t_high = x_t_high.unsqueeze(-4)
 
         bs = x_t_high.size(0)
+
+        # Normalize timestep tensors & broadcast
         if not isinstance(t_low, torch.Tensor):
             t_low = torch.tensor(t_low, device=x_t_high.device)
         if not isinstance(t_high, torch.Tensor):
@@ -855,6 +883,7 @@ class GMFlowSSCFG(GMFlow):
         t_low = t_low.reshape(*t_low.size(), *((x_t_high.dim() - t_low.dim()) * [1]))
         t_high = t_high.reshape(*t_high.size(), *((x_t_high.dim() - t_high.dim()) * [1]))
 
+        # Schedule terms
         sigma = t_high / self.num_timesteps
         sigma_to = t_low / self.num_timesteps
         alpha = 1 - sigma
@@ -864,44 +893,52 @@ class GMFlowSSCFG(GMFlow):
         alpha_over_alpha_to = alpha / alpha_to.clamp(min=eps)
         beta_over_sigma_sq = 1 - (sigma_to_over_sigma * alpha_over_alpha_to) ** 2
 
-        c1 = sigma_to_over_sigma ** 2 * alpha_over_alpha_to
-        c2 = beta_over_sigma_sq * alpha_to
+        c1 = sigma_to_over_sigma ** 2 * alpha_over_alpha_to       # coeff on x_t_high
+        c2 = beta_over_sigma_sq * alpha_to                        # coeff on x_0
+        c3 = beta_over_sigma_sq * sigma_to ** 2                   # added var term
 
-        if isinstance(denoising_output, dict):
-            c3 = beta_over_sigma_sq * sigma_to ** 2
+        def _apply_head(means_pred, logstds_pred, logweights_pred):
             if prediction_type == 'u':
-                means_x_0 = x_t_high - sigma * denoising_output['means']
+                # u = (x_t - x_0)/sigma  =>  x_0 = x_t - sigma * u
+                means_x0 = x_t_high - sigma * means_pred
                 logstds_x_t_low = torch.logaddexp(
-                    (denoising_output['logstds'] + torch.log((sigma * c2).clamp(min=eps))) * 2,
+                    (logstds_pred + torch.log((sigma * c2).clamp(min=eps))) * 2,
                     torch.log(c3.clamp(min=eps))
                 ) / 2
             elif prediction_type == 'x0':
-                means_x_0 = denoising_output['means']
+                means_x0 = means_pred
                 logstds_x_t_low = torch.logaddexp(
-                    (denoising_output['logstds'] + torch.log(c2.clamp(min=eps))) * 2,
+                    (logstds_pred + torch.log(c2.clamp(min=eps))) * 2,
                     torch.log(c3.clamp(min=eps))
                 ) / 2
             else:
-                raise ValueError('Invalid prediction_type.')
-            means_x_t_low = c1 * x_t_high + c2 * means_x_0
-            return dict(
-                means=means_x_t_low,
-                logstds=logstds_x_t_low,
-                logweights=denoising_output['logweights'],
-                uncond_logweights=denoising_output['uncond_logweights']
-            )
+                raise ValueError("prediction_type must be 'u' or 'x0'.")
 
-        else:  # sample mode
-            c3_sqrt = beta_over_sigma_sq ** 0.5 * sigma_to
-            noise = torch.randn_like(denoising_output)
-            if prediction_type == 'u':
-                x_0 = x_t_high - sigma * denoising_output
-            elif prediction_type == 'x0':
-                x_0 = denoising_output
-            else:
-                raise ValueError('Invalid prediction_type.')
-            x_t_low = c1 * x_t_high + c2 * x_0 + c3_sqrt * noise
-            return x_t_low
+            means_x_t_low = c1 * x_t_high + c2 * means_x0
+            return means_x_t_low, logstds_x_t_low, logweights_pred
+
+        # ---- conditional head ----
+        cond_means, cond_logstds, cond_logweights = _apply_head(
+            denoising_output['cond_means'],
+            denoising_output['cond_logstds'],
+            denoising_output['cond_logweights'],
+        )
+
+        # ---- unconditional head ----
+        uncond_means, uncond_logstds, uncond_logweights = _apply_head(
+            denoising_output['uncond_means'],
+            denoising_output['uncond_logstds'],
+            denoising_output['uncond_logweights'],
+        )
+
+        return dict(
+            cond_means=cond_means,
+            cond_logstds=cond_logstds,
+            cond_logweights=cond_logweights,
+            uncond_means=uncond_means,
+            uncond_logstds=uncond_logstds,
+            uncond_logweights=uncond_logweights,
+        )
     
     def loss(self, denoising_output, x_t_low, x_t_high, t_low, t_high, x_t_low_matrix, x0_bank):
         """
@@ -923,8 +960,6 @@ class GMFlowSSCFG(GMFlow):
                 # For GMFlowHybridLoss uncond prior term
                 x_t=x_t_high,
                 num_timesteps=self.num_timesteps,
-                # Pass clean candidates for posterior p(x0 | x_t)
-                x0_bank=x0_bank,
             )
             
             return self.flow_loss(loss_kwargs)
@@ -998,10 +1033,9 @@ class GMFlowSSCFG(GMFlow):
         num_timesteps = cfg.get('num_timesteps', self.num_timesteps)
         num_substeps = cfg.get('num_substeps', 1)
         orthogonal_guidance = cfg.get('orthogonal_guidance', 1.0)
-        temperature = cfg.get("temperature", 1.0)
-        # T_low = cfg.get('temperature_low', cfg.get('T_low', 0.2))
-        # T_high = cfg.get('temperature_high', cfg.get('T_high', 4.0))
-        # scale_by_tau = cfg.get('temperature_scale_by_tau', True)
+        T_low = cfg.get('temperature_low', cfg.get('T_low', 0.2))
+        T_high = cfg.get('temperature_high', cfg.get('T_high', 4.0))
+        scale_by_tau = cfg.get('temperature_scale_by_tau', True)
         save_intermediate = cfg.get('save_intermediate', False)
         order = cfg.get('order', 1)
         gm2_coefs = cfg.get('gm2_coefs', [0.005, 1.0])
@@ -1036,21 +1070,35 @@ class GMFlowSSCFG(GMFlow):
 
             if guidance_scale > 0.0:
                 # Base conditional GM and its iso-Gaussian in u-space
-                gm_cond = gm_output
+                gm_cond_u = gm_output_u
+                gaussian_cond_u = gm_to_iso_gaussian(gm_cond_u)[0]
+                gaussian_cond_u['var'] = gaussian_cond_u['var'].mean(dim=(-1, -2), keepdim=True)
+
+                # Temperature guidance in u-space
+                gaussian_output_u, cfg_bias_u, avg_var_u = temperature_guidance_jit(
+                    gm_cond_u['means'], gm_cond_u['logweights'], gaussian_cond_u['var'],
+                    T_low=T_low, T_high=T_high, scale_by_tau=scale_by_tau,
+                    guidance_scale=guidance_scale)
+
+                # Fuse guided iso-Gaussian with conditional GM (still u-space)
+                gm_output_u = gm_mul_iso_gaussian(
+                    gm_cond_u, iso_gaussian_mul_iso_gaussian(gaussian_output_u, gaussian_cond_u, 1, -1), 1, 1
+                )[0]
+
+                # Convert guided result and auxiliaries to x0-space for downstream
+                gm_output = self.u_to_x_0(gm_output_u, x_t, t)
+                gaussian_output = gm_to_iso_gaussian(gm_output)[0]
+
+                gm_cond = self.u_to_x_0(gm_cond_u, x_t, t)
                 gaussian_cond = gm_to_iso_gaussian(gm_cond)[0]
                 gaussian_cond['var'] = gaussian_cond['var'].mean(dim=(-1, -2), keepdim=True)
 
-                # Temperature guidance in u-space
-                gaussian_output, cfg_bias, avg_var = calculate_direct_guidance(
-                    gm=gm_cond,
-                    T=temperature,
-                    total_var=gaussian_cond['var'],
-                    orthogonal=orthogonal_guidance,
-                    guidance_scale=guidance_scale,
-                )
-                gm_output = gm_mul_iso_gaussian(
-                    gm_cond, iso_gaussian_mul_iso_gaussian(gaussian_output, gaussian_cond, 1, -1),
-                    1, 1)[0]
+                # Map u-space bias/variance to x0 units: Δx0 = -σ Δu, var_x0 = σ² var_u
+                t_tensor = t if isinstance(t, torch.Tensor) else torch.tensor(t, device=x_t.device)
+                t_tensor = t_tensor.reshape(*t_tensor.size(), *((x_t.dim() - t_tensor.dim()) * [1]))
+                sigma = t_tensor / self.num_timesteps
+                cfg_bias = -sigma * cfg_bias_u
+                avg_var = (sigma * sigma) * avg_var_u
             else:
                 # No guidance: convert once and continue in x0-space
                 gm_output = self.u_to_x_0(gm_output, x_t, t)

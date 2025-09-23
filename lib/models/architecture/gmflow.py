@@ -479,21 +479,34 @@ class _GMDiTTransformer2DModel_Uncond(DiTTransformer2DModel):
                 norm_eps=self.config.norm_eps)
             for _ in range(self.config.num_layers)])
 
-        # 3. Output blocks.
+        # 3. Output blocks (conditional head).
         self.norm_out = nn.LayerNorm(self.inner_dim, elementwise_affine=False, eps=1e-6)
         self.proj_out_1 = nn.Linear(self.inner_dim, 2 * self.inner_dim)
         self.proj_out_2 = nn.Linear(
             self.inner_dim, self.config.patch_size * self.config.patch_size * self.gm_channels)
-        self.uncond_proj_out_logweights = nn.Linear(
-            self.inner_dim, self.config.patch_size * self.config.patch_size * self.config.num_gaussians)
-
         self.gm_out = GMOutput2D(
             num_gaussians,
             self.out_channels,
             self.inner_dim,
             constant_logstd=constant_logstd,
             logstd_inner_dim=logstd_inner_dim,
-            num_logstd_layers=gm_num_logstd_layers)
+            num_logstd_layers=gm_num_logstd_layers,
+            activation_fn=self.config.activation_fn if hasattr(self.config, "activation_fn") else 'gelu-approximate'
+        )
+
+        # === NEW: unconditional head ===
+        self.uncond_proj_out_1 = nn.Linear(self.inner_dim, 2 * self.inner_dim)
+        self.uncond_proj_out_2 = nn.Linear(
+            self.inner_dim, self.config.patch_size * self.config.patch_size * self.gm_channels)
+        self.uncond_gm_out = GMOutput2D(
+            num_gaussians,
+            self.out_channels,
+            self.inner_dim,
+            constant_logstd=constant_logstd,
+            logstd_inner_dim=logstd_inner_dim,
+            num_logstd_layers=gm_num_logstd_layers,
+            activation_fn=self.config.activation_fn if hasattr(self.config, "activation_fn") else 'gelu-approximate'
+        )
 
     # https://github.com/facebookresearch/DiT/blob/main/models.py
     def init_weights(self):
@@ -503,21 +516,23 @@ class _GMDiTTransformer2DModel_Uncond(DiTTransformer2DModel):
             elif isinstance(m, nn.Embedding):
                 torch.nn.init.normal_(m.weight, mean=0.0, std=0.02)
 
-        # Initialize patch_embed like nn.Linear (instead of nn.Conv2d)
+        # Initialize patch_embed like nn.Linear
         w = self.pos_embed.proj.weight.data
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
         nn.init.constant_(self.pos_embed.proj.bias, 0)
 
-        # Zero-out adaLN modulation layers in DiT blocks
+        # Zero-out adaLN modulation layers
         for m in self.modules():
             if isinstance(m, AdaLayerNormZero):
                 constant_init(m.linear, val=0)
 
-        # Zero-out output layers
+        # Zero-out output MLPs’ last layers (shift/scale)
         constant_init(self.proj_out_1, val=0)
-        constant_init(self.uncond_proj_out_logweights, val=0)
+        constant_init(self.uncond_proj_out_1, val=0)  # NEW
 
+        # Init GM heads
         self.gm_out.init_weights()
+        self.uncond_gm_out.init_weights()  # NEW
 
     def forward(
             self,
@@ -525,35 +540,29 @@ class _GMDiTTransformer2DModel_Uncond(DiTTransformer2DModel):
             timestep: Optional[torch.LongTensor] = None,
             class_labels: Optional[torch.LongTensor] = None,
             cross_attention_kwargs: Dict[str, Any] = None):
-        # 1. Input
+
+        # 1) Input -> patch embed
         bs, _, h, w = hidden_states.size()
         height, width = h // self.patch_size, w // self.patch_size
         hidden_states = self.pos_embed(hidden_states)
 
-        cond_emb = self.emb(
-            timestep, class_labels, hidden_dtype=hidden_states.dtype)
-        dropout_enabled = self.config.class_dropout_prob > 0 and self.training
-        if dropout_enabled:
-            uncond_emb = self.emb(timestep, torch.full_like(
-                class_labels, self.config.num_embeds_ada_norm), hidden_dtype=hidden_states.dtype)
+        # embeddings
+        cond_emb = self.emb(timestep, class_labels, hidden_dtype=hidden_states.dtype)
+        uncond_emb = self.emb(
+            timestep,
+            torch.full_like(class_labels, self.config.num_embeds_ada_norm),
+            hidden_dtype=hidden_states.dtype,
+        )
 
-        # 2. Blocks
+        # 2) Transformer blocks (NO dropout mixing — always use cond_emb)
         for block in self.transformer_blocks:
-            if dropout_enabled:
-                dropout_mask = torch.rand((bs, 1), device=hidden_states.device) < self.config.class_dropout_prob
-                emb = torch.where(dropout_mask, uncond_emb, cond_emb)
-            else:
-                emb = cond_emb
-
             if self.training and self.gradient_checkpointing:
-
                 def create_custom_forward(module, return_dict=None):
                     def custom_forward(*inputs):
                         if return_dict is not None:
                             return module(*inputs, return_dict=return_dict)
                         else:
                             return module(*inputs)
-
                     return custom_forward
 
                 hidden_states = torch.utils.checkpoint.checkpoint(
@@ -565,9 +574,8 @@ class _GMDiTTransformer2DModel_Uncond(DiTTransformer2DModel):
                     timestep,
                     cross_attention_kwargs,
                     class_labels,
-                    emb,
+                    cond_emb,
                     use_reentrant=False)
-
             else:
                 hidden_states = block(
                     hidden_states,
@@ -577,39 +585,41 @@ class _GMDiTTransformer2DModel_Uncond(DiTTransformer2DModel):
                     timestep=timestep,
                     cross_attention_kwargs=cross_attention_kwargs,
                     class_labels=class_labels,
-                    emb=emb)
+                    emb=cond_emb)
 
-        # 3. Output
-        if dropout_enabled:
-            dropout_mask = torch.rand((bs, 1), device=hidden_states.device) < self.config.class_dropout_prob
-            emb = torch.where(dropout_mask, uncond_emb, cond_emb)
-        else:
-            emb = cond_emb
-        norm_hidden_states = self.norm_out(hidden_states)
-        shift, scale = self.proj_out_1(F.silu(emb)).chunk(2, dim=1)
-        hidden_states = norm_hidden_states * (1 + scale[:, None]) + shift[:, None]
+        # 3) Heads: compute BOTH from the same normalized hidden_states
+        hs_norm = self.norm_out(hidden_states)
 
-        if dropout_enabled:
-            uncond_shift, uncond_scale = self.proj_out_1(F.silu(uncond_emb)).chunk(2, dim=1)
-            uncond_hidden_states = norm_hidden_states * (1 + uncond_scale[:, None]) + uncond_shift[:, None]
-        else:
-            uncond_hidden_states = hidden_states
+        # --- conditional head ---
+        shift_c, scale_c = self.proj_out_1(F.silu(cond_emb)).chunk(2, dim=1)
+        hs_c = hs_norm * (1 + scale_c[:, None]) + shift_c[:, None]
+        x_c = self.proj_out_2(hs_c).reshape(
+            bs, height, width, self.patch_size, self.patch_size, self.gm_channels
+        ).permute(0, 5, 1, 3, 2, 4).reshape(
+            bs, self.gm_channels, height * self.patch_size, width * self.patch_size
+        )
+        gm_c = self.gm_out(x_c, cond_emb.detach())
 
-        hidden_states = self.proj_out_2(hidden_states).reshape(
-                bs, height, width, self.patch_size, self.patch_size, self.gm_channels
-            ).permute(0, 5, 1, 3, 2, 4).reshape(
-                bs, self.gm_channels, height * self.patch_size, width * self.patch_size)
+        # --- unconditional head (separate params) ---
+        shift_u, scale_u = self.uncond_proj_out_1(F.silu(uncond_emb)).chunk(2, dim=1)
+        hs_u = hs_norm * (1 + scale_u[:, None]) + shift_u[:, None]
+        x_u = self.uncond_proj_out_2(hs_u).reshape(
+            bs, height, width, self.patch_size, self.patch_size, self.gm_channels
+        ).permute(0, 5, 1, 3, 2, 4).reshape(
+            bs, self.gm_channels, height * self.patch_size, width * self.patch_size
+        )
+        gm_u = self.uncond_gm_out(x_u, uncond_emb.detach())
 
-        out_dict = self.gm_out(hidden_states, cond_emb.detach())
+        # 4) Return explicit, separate outputs
+        return dict(
+            cond_means=gm_c['means'],
+            cond_logweights=gm_c['logweights'],
+            cond_logstds=gm_c['logstds'],
+            uncond_means=gm_u['means'],
+            uncond_logweights=gm_u['logweights'],
+            uncond_logstds=gm_u['logstds'],
+        )
 
-        uncond_logweights = self.uncond_proj_out_logweights(uncond_hidden_states).reshape(
-                bs, height, width, self.patch_size, self.patch_size, self.config.num_gaussians
-            ).permute(0, 5, 1, 3, 2, 4).reshape(
-                bs, self.config.num_gaussians, 1, height * self.patch_size, width * self.patch_size
-            ).log_softmax(dim=1)
-        out_dict['uncond_logweights'] = uncond_logweights
-
-        return out_dict
     
     
 @MODULES.register_module()
