@@ -122,8 +122,8 @@ class LatentDiffusionClassImage(BaseModel):
 
         with torch.no_grad():
             class_labels = data['labels']
-            temperature_guidance = cfg.get('temperature_guidance', False)
-            if (guidance_scale != 0.0 and guidance_scale != 1.0) and (not temperature_guidance):
+            single_step_cfg = cfg.get('single_step_cfg', False)
+            if (guidance_scale != 0.0 and guidance_scale != 1.0) and (not single_step_cfg):
                 # Only duplicate labels for probabilistic CFG; temperature guidance uses cond only
                 class_labels = torch.cat([data['negative_labels'], class_labels], dim=0)
 

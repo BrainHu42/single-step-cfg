@@ -13,6 +13,7 @@ from mmgen.models.builder import MODULES, build_module
 from mmgen.models.diffusions.utils import _get_noise_batch
 
 from . import GaussianFlow, schedulers
+from lib.models.diffusions.gaussian_flow import guidance_jit
 from lib.ops.gmflow_ops.gmflow_ops import (
     gm_to_sample, gm_to_mean, gaussian_samples_to_gm_samples, gm_samples_to_gaussian_samples,
     iso_gaussian_mul_iso_gaussian, gm_mul_iso_gaussian, gm_to_iso_gaussian, gm_spectral_logprobs)
@@ -355,8 +356,7 @@ class GMFlowMixin:
                 return dict(
                     means=means_x_0,
                     logstds=logstds_x_0,
-                    logweights=denoising_output['logweights'],
-                    uncond_logweights=denoising_output['uncond_logweights'])
+                    logweights=denoising_output['logweights'])
             elif 'var' in denoising_output:
                 mean = x_t - sigma * denoising_output['mean']
                 var = denoising_output['var'] * sigma.square()
@@ -1053,39 +1053,65 @@ class GMFlowSSCFG(GMFlow):
             # Only conditional prediction is required (keep in u-space for guidance)
             gm_output = self.pred(x_t, t, **kwargs)
             assert isinstance(gm_output, dict)
-            gm_output = self.u_to_x_0(gm_output, x_t, t)
 
             if guidance_scale > 0.0:
-                # Base conditional GM and its iso-Gaussian in u-space
-                gm_cond_u = gm_output_u
-                gaussian_cond_u = gm_to_iso_gaussian(gm_cond_u)[0]
-                gaussian_cond_u['var'] = gaussian_cond_u['var'].mean(dim=(-1, -2), keepdim=True)
+                if gm_output.get("uncond_means") is not None:   # separate gm
+                    gm_cond = dict(
+                        means=gm_output["means"],
+                        logweights=gm_output["logweights"],
+                        logstds=gm_output["logstds"],
+                    )
+                    gm_uncond = dict(
+                        means=gm_output["uncond_means"],
+                        logweights=gm_output["uncond_logweights"],
+                        logstds=gm_output["uncond_logstds"],
+                    )
+                    bias = guidance_jit(gm_to_mean(gm_cond), gm_to_mean(gm_uncond), guidance_scale, orthogonal_guidance)
+                
+                    gm_output = dict(
+                        means=gm_cond['means'] + bias.unsqueeze(-4),
+                        logstds=gm_cond['logstds'],
+                        logweights=gm_cond['logweights']
+                    )
+                    
+                    gm_output = self.u_to_x_0(gm_output, x_t, t)
+                    gaussian_output = gm_to_iso_gaussian(gm_output)[0]
+                    gm_cond = gaussian_cond = avg_var = cfg_bias = None
+                
+                else:
+                    raise ValueError("Guidance method not implemented")
+                    
+                
+                # # Base conditional GM and its iso-Gaussian in u-space
+                # gm_cond_u = gm_output_u
+                # gaussian_cond_u = gm_to_iso_gaussian(gm_cond_u)[0]
+                # gaussian_cond_u['var'] = gaussian_cond_u['var'].mean(dim=(-1, -2), keepdim=True)
 
-                # Temperature guidance in u-space
-                gaussian_output_u, cfg_bias_u, avg_var_u = temperature_guidance_jit(
-                    gm_cond_u['means'], gm_cond_u['logweights'], gaussian_cond_u['var'],
-                    T_low=T_low, T_high=T_high, scale_by_tau=scale_by_tau,
-                    guidance_scale=guidance_scale)
+                # # Temperature guidance in u-space
+                # gaussian_output_u, cfg_bias_u, avg_var_u = temperature_guidance_jit(
+                #     gm_cond_u['means'], gm_cond_u['logweights'], gaussian_cond_u['var'],
+                #     T_low=T_low, T_high=T_high, scale_by_tau=scale_by_tau,
+                #     guidance_scale=guidance_scale)
 
-                # Fuse guided iso-Gaussian with conditional GM (still u-space)
-                gm_output_u = gm_mul_iso_gaussian(
-                    gm_cond_u, iso_gaussian_mul_iso_gaussian(gaussian_output_u, gaussian_cond_u, 1, -1), 1, 1
-                )[0]
+                # # Fuse guided iso-Gaussian with conditional GM (still u-space)
+                # gm_output_u = gm_mul_iso_gaussian(
+                #     gm_cond_u, iso_gaussian_mul_iso_gaussian(gaussian_output_u, gaussian_cond_u, 1, -1), 1, 1
+                # )[0]
 
-                # Convert guided result and auxiliaries to x0-space for downstream
-                gm_output = self.u_to_x_0(gm_output_u, x_t, t)
-                gaussian_output = gm_to_iso_gaussian(gm_output)[0]
+                # # Convert guided result and auxiliaries to x0-space for downstream
+                # gm_output = self.u_to_x_0(gm_output_u, x_t, t)
+                # gaussian_output = gm_to_iso_gaussian(gm_output)[0]
 
-                gm_cond = self.u_to_x_0(gm_cond_u, x_t, t)
-                gaussian_cond = gm_to_iso_gaussian(gm_cond)[0]
-                gaussian_cond['var'] = gaussian_cond['var'].mean(dim=(-1, -2), keepdim=True)
+                # gm_cond = self.u_to_x_0(gm_cond_u, x_t, t)
+                # gaussian_cond = gm_to_iso_gaussian(gm_cond)[0]
+                # gaussian_cond['var'] = gaussian_cond['var'].mean(dim=(-1, -2), keepdim=True)
 
-                # Map u-space bias/variance to x0 units: Δx0 = -σ Δu, var_x0 = σ² var_u
-                t_tensor = t if isinstance(t, torch.Tensor) else torch.tensor(t, device=x_t.device)
-                t_tensor = t_tensor.reshape(*t_tensor.size(), *((x_t.dim() - t_tensor.dim()) * [1]))
-                sigma = t_tensor / self.num_timesteps
-                cfg_bias = -sigma * cfg_bias_u
-                avg_var = (sigma * sigma) * avg_var_u
+                # # Map u-space bias/variance to x0 units: Δx0 = -σ Δu, var_x0 = σ² var_u
+                # t_tensor = t if isinstance(t, torch.Tensor) else torch.tensor(t, device=x_t.device)
+                # t_tensor = t_tensor.reshape(*t_tensor.size(), *((x_t.dim() - t_tensor.dim()) * [1]))
+                # sigma = t_tensor / self.num_timesteps
+                # cfg_bias = -sigma * cfg_bias_u
+                # avg_var = (sigma * sigma) * avg_var_u
             else:
                 # No guidance: convert once and continue in x0-space
                 gm_output = self.u_to_x_0(gm_output, x_t, t)

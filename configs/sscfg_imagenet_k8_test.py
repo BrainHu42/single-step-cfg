@@ -1,4 +1,5 @@
-name = 'sscfg_imagenet_k8_test'
+# name = 'sscfg_imagenet_k8_test'
+name = 'separate_gm_imagenet_k8_test'
 
 model = dict(
     type='LatentDiffusionClassImage',
@@ -39,28 +40,28 @@ work_dir = 'work_dirs/' + name
 train_cfg = dict()
 test_cfg = dict(
     latent_size=(4, 32, 32),
-    temperature_guidance=True,
-    T_low=0.4,
-    T_high=3,
+    single_step_cfg=True,
+    # T_low=0.4,
+    # T_high=3,
 )
 
 optimizer = {}
 data = dict(
     workers_per_gpu=4,
     val=dict(
-        num_test_images=2000, # TODO: change to 50_000 for final eval
+        num_test_images=1600, # TODO: change to 50_000 for final eval
         type='ImageNet',
         test_mode=True),
-    val_dataloader=dict(samples_per_gpu=60),
-    test_dataloader=dict(samples_per_gpu=60),
+    val_dataloader=dict(samples_per_gpu=80),
+    test_dataloader=dict(samples_per_gpu=80),
     persistent_workers=True,
     prefetch_factor=64)
 lr_config = dict()
 checkpoint_config = dict()
 
 
-guidance_scales = [0.08]
-temperatures = [0.8, 0.7, 0.6]
+guidance_scales = [2]
+# temperatures = [0.8, 0.7, 0.6]
 
 methods = dict(
     gmode1=dict(
@@ -75,39 +76,70 @@ methods = dict(
 
 evaluation = []
 
-for step, substep in [(8, 1), (32, 1)]:
+
+for step, substep in [(8, 1)]:  # (8, 16)
     for method_name, method_config in methods.items():
         for guidance_scale in guidance_scales:
-            for temp in temperatures:
-                temp_str = str(temp) # f"{t_low:.2f}-{t_high:.2f}"
-                test_cfg_override = dict(
-                    orthogonal_guidance=0,
-                    guidance_scale=guidance_scale,
-                    temperature=temp,
-                    # T_low=t_low,
-                    # T_high=t_high,
-                    num_timesteps=step)
-                if 'gmode' in method_name:
-                    test_cfg_override.update(num_substeps=substep)
-                test_cfg_override.update(method_config)
-                evaluation.append(
-                    dict(
-                        type='GenerativeEvalHook',
-                        data='val',
-                        prefix=f'{method_name}_g{guidance_scale:.2f}_temp{temp_str}_step{step}',
-                        sample_kwargs=dict(
-                            test_cfg_override=test_cfg_override),
-                        interval=eval_interval,
-                        feed_batch_size=32,
-                        viz_step=512,
-                        metrics=[
-                            dict(
-                                type='InceptionMetrics',
-                                resize=False,
-                                reference_pkl='huggingface://Lakonik/inception_feats/imagenet256_inception_adm.pkl'),
-                        ],
-                        viz_dir='viz/' + name + f'/{method_name}_g{guidance_scale:.2f}_temp{temp_str}_step{step}',
-                        save_best_ckpt=False))
+            test_cfg_override = dict(
+                orthogonal_guidance=1.0,
+                guidance_scale=guidance_scale,
+                num_timesteps=step)
+            if 'gmode' in method_name:
+                test_cfg_override.update(num_substeps=substep)
+            test_cfg_override.update(method_config)
+            evaluation.append(
+                dict(
+                    type='GenerativeEvalHook',
+                    data='val',
+                    prefix=f'{method_name}_g{guidance_scale:.2f}_step{step}',
+                    sample_kwargs=dict(
+                        test_cfg_override=test_cfg_override),
+                    interval=eval_interval,
+                    feed_batch_size=32,
+                    viz_step=512,
+                    metrics=[
+                        dict(
+                            type='InceptionMetrics',
+                            resize=False,
+                            reference_pkl='huggingface://Lakonik/inception_feats/imagenet256_inception_adm.pkl'),
+                    ],
+                    viz_dir='viz/' + name + f'/{method_name}_g{guidance_scale:.2f}_step{step}',
+                    save_best_ckpt=False))
+
+
+# for step, substep in [(8, 1), (32, 1)]:
+#     for method_name, method_config in methods.items():
+#         for guidance_scale in guidance_scales:
+#             for temp in temperatures:
+#                 temp_str = str(temp) # f"{t_low:.2f}-{t_high:.2f}"
+#                 test_cfg_override = dict(
+#                     orthogonal_guidance=1,
+#                     guidance_scale=guidance_scale,
+#                     temperature=temp,
+#                     # T_low=t_low,
+#                     # T_high=t_high,
+#                     num_timesteps=step)
+#                 if 'gmode' in method_name:
+#                     test_cfg_override.update(num_substeps=substep)
+#                 test_cfg_override.update(method_config)
+#                 evaluation.append(
+#                     dict(
+#                         type='GenerativeEvalHook',
+#                         data='val',
+#                         prefix=f'{method_name}_g{guidance_scale:.2f}_temp{temp_str}_step{step}',
+#                         sample_kwargs=dict(
+#                             test_cfg_override=test_cfg_override),
+#                         interval=eval_interval,
+#                         feed_batch_size=32,
+#                         viz_step=512,
+#                         metrics=[
+#                             dict(
+#                                 type='InceptionMetrics',
+#                                 resize=False,
+#                                 reference_pkl='huggingface://Lakonik/inception_feats/imagenet256_inception_adm.pkl'),
+#                         ],
+#                         viz_dir='viz/' + name + f'/{method_name}_g{guidance_scale:.2f}_temp{temp_str}_step{step}',
+#                         save_best_ckpt=False))
 
 total_iters = 200000
 log_config = dict(
