@@ -45,18 +45,18 @@ optimizer = {}
 data = dict(
     workers_per_gpu=4,
     val=dict(
-        num_test_images=2_000, # TODO: change to 50_000 for final eval
+        num_test_images=1600, # TODO: change to 50_000 for final eval
         type='ImageNet',
         test_mode=True),
-    val_dataloader=dict(samples_per_gpu=60),
-    test_dataloader=dict(samples_per_gpu=60),
+    val_dataloader=dict(samples_per_gpu=80),
+    test_dataloader=dict(samples_per_gpu=80),
     persistent_workers=True,
     prefetch_factor=64)
 lr_config = dict()
 checkpoint_config = dict()
 
 
-guidance_scales = [0.47] #.47] #0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.11, 0.13, 0.16, 0.19, 0.23, 0.27, 0.33, 0.39, 0.47, 0.55, 0.65, 0.75]
+guidance_scales = [2.1] #.47] #0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.11, 0.13, 0.16, 0.19, 0.23, 0.27, 0.33, 0.39, 0.47, 0.55, 0.65, 0.75]
 
 methods = dict(
     gmode2=dict(
@@ -127,4 +127,4 @@ cudnn_benchmark = True
 opencv_num_threads = 0
 mp_start_method = 'fork'
 
-# python test.py configs/gmflow_imagenet_k8_test.py checkpoints/gmflow_imagenet_k8_8gpus/latest.pth --gpu-ids 0
+# python test.py configs/gmflow_imagenet_k8_test.py /workspace/GMFlow/checkpoints/sscfg_imagenet_k8_train/iter_100000.pth --gpu-ids 0

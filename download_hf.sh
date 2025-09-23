@@ -1,4 +1,3 @@
-export HF_TOKEN=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
 mkdir -p ./data/imagenet
 cd ./data/imagenet
 huggingface-cli download BrianHu42/imagenet-latents \

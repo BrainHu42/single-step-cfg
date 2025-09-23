@@ -11,7 +11,7 @@ model = dict(
     diffusion=dict(
         type='GMFlowSSCFG',
         denoising=dict(
-            type='GMDiTTransformer2DModel_Uncond',
+            type='GMDiTTransformer2DModel',
             num_gaussians=8,
             logstd_inner_dim=1024,
             gm_num_logstd_layers=2,
@@ -50,8 +50,11 @@ data = dict(
     workers_per_gpu=4,
     val=dict(
         num_test_images=1600, # TODO: change to 50_000 for final eval
+        num_test_images=1600, # TODO: change to 50_000 for final eval
         type='ImageNet',
         test_mode=True),
+    val_dataloader=dict(samples_per_gpu=80),
+    test_dataloader=dict(samples_per_gpu=80),
     val_dataloader=dict(samples_per_gpu=80),
     test_dataloader=dict(samples_per_gpu=80),
     persistent_workers=True,
@@ -169,4 +172,4 @@ opencv_num_threads = 0
 mp_start_method = 'fork'
 
 
-# python test.py configs/sscfg_imagenet_k8_test.py checkpoints/sscfg_imagenet_k8_train/iter_120000.pth --deterministic --gpu-ids 0
+# python test.py configs/sscfg_imagenet_k8_test.py /workspace/GMFlow/checkpoints/gmflow_imagenet_k8_8gpus/latest.pth --deterministic --gpu-ids 0

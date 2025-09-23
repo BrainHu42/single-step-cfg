@@ -49,39 +49,11 @@ def temperature_guidance_jit(
     T_low: float = 0.2,
     T_high: float = 4.0,
     scale_by_tau: bool = True,
-    eps: float = 1e-8,
     orthogonal: float = 1.0,
     orthogonal_axis: Optional[torch.Tensor] = None,
     guidance_scale: float = 0.0,
+    eps: float = 1e-8,
 ):
-    """
-    Temperature-based guidance using conditional GM parameters, with optional
-    orthogonal projection and probabilistic variance scaling.
-
-    Bias direction is obtained from a finite-difference between sharpened
-    (T_low) and smoothed (T_high) mixture means, optionally scaled by the
-    difference in inverse temperatures. The bias magnitude can be normalized
-    and scaled by `guidance_scale`, and its component along `orthogonal_axis`
-    can be reduced by `orthogonal`.
-
-    Args:
-        gm_means: (B, *, G, C, H, W) Gaussian means.
-        gm_logweights: (B, *, G, 1, H, W) Gaussian log-weights.
-        total_var: (B, *, C, H, W) isotropic variance for fused Gaussian.
-        T_low: Lower temperature for conditional sharpening.
-        T_high: Higher temperature for unconditional smoothing.
-        scale_by_tau: If True, divide finite-difference bias by 1/T_low - 1/T_high.
-        eps: Numerical epsilon.
-        orthogonal: In [0,1]; 0 disables projection, 1 removes full parallel component.
-        orthogonal_axis: Optional axis; defaults to the T_low mixture mean if None.
-        guidance_scale: If > 0, scales bias like probabilistic_guidance_jit and
-                        sets var_out = total_var * (1 - guidance_scale^2).
-
-    Returns:
-        gaussian_output: dict(mean=(B,*,C,H,W), var=(B,*,C,H,W)).
-        bias: (B,*,C,H,W) final applied bias.
-        avg_var: (B,*,1,1,1) mean variance used for normalization.
-    """
     # Overall (unbiased) mixture mean across Gaussian axis (-4)
     w = torch.softmax(gm_logweights, dim=-4)
     overall_mean = (gm_means * w).sum(dim=-4)
@@ -737,19 +709,35 @@ class GMFlow(GaussianFlow, GMFlowMixin):
             assert isinstance(gm_output, dict)
             gm_output = self.u_to_x_0(gm_output, x_t_input, t)
 
-            # ========== Probabilistic CFG ==========
+            # ========== Standard CFG ==========
             if use_guidance:
                 gm_cond = {k: v[num_batches:] for k, v in gm_output.items()}
                 gm_uncond = {k: v[:num_batches] for k, v in gm_output.items()}
+                cond_mean = gm_to_mean(gm_cond)
                 uncond_mean = gm_to_mean(gm_uncond)
-                gaussian_cond = gm_to_iso_gaussian(gm_cond)[0]
-                gaussian_cond['var'] = gaussian_cond['var'].mean(dim=(-1, -2), keepdim=True)
-                gaussian_output, cfg_bias, avg_var = probabilistic_guidance_jit(
-                    gaussian_cond['mean'], gaussian_cond['var'], uncond_mean, guidance_scale,
-                    orthogonal=orthogonal_guidance)
-                gm_output = gm_mul_iso_gaussian(
-                    gm_cond, iso_gaussian_mul_iso_gaussian(gaussian_output, gaussian_cond, 1, -1),
-                    1, 1)[0]
+
+                bias = guidance_scale * (cond_mean - uncond_mean)
+
+                if orthogonal_guidance > 0.0:
+                    axis = cond_mean
+                    if axis.shape != bias.shape:
+                        axis = axis.expand_as(bias)
+                    reduce_dims = (-3, -2, -1) if bias.dim() >= 3 else (-1,)
+                    num = (bias * axis).mean(dim=reduce_dims, keepdim=True)
+                    den = (axis * axis).mean(dim=reduce_dims, keepdim=True).clamp(min=1e-6)
+                    proj = (num / den) * axis
+                    bias = bias - proj.mul(orthogonal_guidance)
+
+                gm_guided = {}
+                for k, v in gm_uncond.items():
+                    if torch.is_tensor(v):
+                        gm_guided[k] = v.clone()
+                    else:
+                        gm_guided[k] = deepcopy(v)
+                gm_guided['means'] = gm_guided['means'] + bias.unsqueeze(1)
+                gm_output = gm_guided
+                gaussian_output = gm_to_iso_gaussian(gm_output)[0]
+                gm_cond = gaussian_cond = avg_var = cfg_bias = None
             else:
                 gaussian_output = gm_to_iso_gaussian(gm_output)[0]
                 gm_cond = gaussian_cond = avg_var = cfg_bias = None
@@ -1035,6 +1023,7 @@ class GMFlowSSCFG(GMFlow):
         self.intermediate_gm_x_0 = []
         self.intermediate_gm_trans = []
         self.intermediate_t = []
+        use_guidance = guidance_scale > 0.0
         assert order in [1, 2]
 
         if show_pbar:
@@ -1050,8 +1039,9 @@ class GMFlowSSCFG(GMFlow):
                 self.intermediate_x_t.append(x_t)
                 self.intermediate_t.append(t)
 
-            # Only conditional prediction is required (keep in u-space for guidance)
-            gm_output = self.pred(x_t, t, **kwargs)
+            x_t_input = x_t
+
+            gm_output = self.pred(x_t_input, t, **kwargs)
             assert isinstance(gm_output, dict)
 
             if guidance_scale > 0.0:
