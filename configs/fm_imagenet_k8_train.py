@@ -1,5 +1,5 @@
 # 512 samples per gpu, requires 40GB VRAM
-name = 'sscfg_imagenet_k8_train'
+name = 'fm_imagenet_k8_8gpus'
 
 model = dict(
     type='LatentDiffusionClassImage',
@@ -9,29 +9,23 @@ model = dict(
         freeze=True,
         torch_dtype='float16'),
     diffusion=dict(
-        type='GMFlowSSCFG',
+        type='GaussianFlow',
         denoising=dict(
-            type='GMDiTTransformer2DModel_Uncond',
-            num_gaussians=8,
+            type='GMDiTTransformer2DModel',
+            num_gaussians=1,
+            constant_logstd=0.0,
             logstd_inner_dim=1024,
-            gm_num_logstd_layers=2,
+            gm_num_logstd_layers=1,
             num_attention_heads=16,
             attention_head_dim=72,
             in_channels=4,
             num_layers=28,
             sample_size=32,  # 256
-            torch_dtype='float16',
+            torch_dtype='float32',
             checkpointing=True),
-        # spectrum_net=dict(
-        #     type='SpectrumMLP',
-        #     base_size=(4, 32, 32),
-        #     layers=[64, 8],
-        #     torch_dtype='float32'),
         flow_loss=dict(
-            type='GMFlowHybridLoss',
-            log_cfgs=dict(type='quartile', prefix_name='loss_trans', total_timesteps=1000),
-            data_info=None,
-            p_uncond=0.25,
+            type='DDPMMSELossMod',
+            data_info=dict(pred='means', target='u_t'),
             weight_scale=2.0),
         num_timesteps=1000,
         timestep_sampler=dict(type='ContinuousTimeStepSampler', shift=1.0, logit_normal_enable=True),
@@ -43,11 +37,11 @@ save_interval = 1000
 must_save_interval = 20000  # interval to save regardless of max_keep_ckpts
 eval_interval = 20000
 work_dir = 'work_dirs/' + name
-total_iters = 200_000 
+total_iters = 100_000
 
 train_cfg = dict(
     trans_ratio=0.5,
-    prob_class=1.0,
+    prob_class=0.9,
     diffusion_grad_clip=10.0,
     diffusion_grad_clip_begin_iter=1000,
     grad_accum_steps=2,
@@ -65,14 +59,13 @@ optimizer = {
     ),
 }
 data = dict(
-    workers_per_gpu=6,
+    workers_per_gpu=4,
     train=dict(
         type='ImageNet',
         data_root='data/imagenet/train_cache',
         datalist_path='data/imagenet/train_cache.txt'),
     train_dataloader=dict(samples_per_gpu=128),
     val=dict(
-        num_test_images=10_000,
         type='ImageNet',
         test_mode=True),
     val_dataloader=dict(samples_per_gpu=125),
@@ -93,7 +86,7 @@ checkpoint_config = dict(
 
 step = 16
 substep = 8
-guidance_scale = 0.1
+guidance_scale = 0.04
 
 evaluation = [
     dict(

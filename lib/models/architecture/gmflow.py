@@ -612,9 +612,9 @@ class _GMDiTTransformer2DModel_Uncond(DiTTransformer2DModel):
 
         # 4) Return explicit, separate outputs
         return dict(
-            cond_means=gm_c['means'],
-            cond_logweights=gm_c['logweights'],
-            cond_logstds=gm_c['logstds'],
+            means=gm_c['means'],
+            logweights=gm_c['logweights'],
+            logstds=gm_c['logstds'],
             uncond_means=gm_u['means'],
             uncond_logweights=gm_u['logweights'],
             uncond_logstds=gm_u['logstds'],

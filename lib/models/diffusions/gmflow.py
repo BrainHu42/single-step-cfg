@@ -850,20 +850,6 @@ class GMFlowSSCFG(GMFlow):
         ):
         """
         Reverse transition for GM parameterization using split heads.
-
-        Input (from model.forward):
-            denoising_output: {
-                'cond_means','cond_logweights','cond_logstds',
-                'uncond_means','uncond_logweights','uncond_logstds'
-            }
-            x_t_high: [B, C, H, W]
-            t_low, t_high: scalar or [B]
-
-        Returns:
-            {
-            'cond_means','cond_logstds','cond_logweights',
-            'uncond_means','uncond_logstds','uncond_logweights'
-            }, where *_means/*_logstds are for x_{t_low}.
         """
         if isinstance(denoising_output, dict):
             # make x compatible with [B, G, C, H, W]
@@ -918,10 +904,10 @@ class GMFlowSSCFG(GMFlow):
             return means_x_t_low, logstds_x_t_low, logweights_pred
 
         # ---- conditional head ----
-        cond_means, cond_logstds, cond_logweights = _apply_head(
-            denoising_output['cond_means'],
-            denoising_output['cond_logstds'],
-            denoising_output['cond_logweights'],
+        means, logstds, logweights = _apply_head(
+            denoising_output['means'],
+            denoising_output['logstds'],
+            denoising_output['logweights'],
         )
 
         # ---- unconditional head ----
@@ -932,15 +918,15 @@ class GMFlowSSCFG(GMFlow):
         )
 
         return dict(
-            cond_means=cond_means,
-            cond_logstds=cond_logstds,
-            cond_logweights=cond_logweights,
+            means=means,
+            logstds=logstds,
+            logweights=logweights,
             uncond_means=uncond_means,
             uncond_logstds=uncond_logstds,
             uncond_logweights=uncond_logweights,
         )
     
-    def loss(self, denoising_output, x_t_low, x_t_high, t_low, t_high, x_t_low_matrix, x0_bank):
+    def loss(self, denoising_output, x_t_low, x_t_high, t_low, t_high, x_t_low_matrix, x_0):
         """
         GMFlow transition loss.
         """
@@ -960,6 +946,7 @@ class GMFlowSSCFG(GMFlow):
                 # For GMFlowHybridLoss uncond prior term
                 x_t=x_t_high,
                 num_timesteps=self.num_timesteps,
+                x_0=x_0,
             )
             
             return self.flow_loss(loss_kwargs)

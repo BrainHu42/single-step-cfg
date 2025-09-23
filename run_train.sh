@@ -6,12 +6,12 @@
 set -euo pipefail  # exit on error/undefined var; robust scripting
 
 # --------------------- HARD-CODED SETTINGS -----------------------------------
-MAX_RETRIES=5            # How many times to retry after a non-zero exit.
+MAX_RETRIES=3            # How many times to retry after a non-zero exit.
                           # Set to -1 for infinite retries.
 RETRY_DELAY=15            # Seconds to sleep between retries.
 
 NPROC_PER_NODE=4          # Number of GPUs for torchrun on this machine.
-CONFIG="configs/gmflow_imagenet_k8_train.py"  # Your training config path.
+CONFIG="configs/sscfg_imagenet_k8_train.py"  # Your training config path.
 
 LOG_DIR="logs"            # Where to save logs.
 LOG_FILE="$LOG_DIR/train_$(date +%Y%m%d_%H%M%S).log"  # Unique log per run.
