@@ -152,7 +152,7 @@ runner = dict(
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
 load_from = None
-resume_from = "/data/single-step-cfg/checkpoints/gmflow_imagenet_k8_train/iter_95000.pth" # f'checkpoints/{name}/latest.pth'  # resume by default
+resume_from = f'checkpoints/{name}/latest.pth'  # resume by default
 workflow = [('train', save_interval)]
 use_ddp_wrapper = True
 find_unused_parameters = False

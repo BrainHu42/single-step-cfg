@@ -161,6 +161,8 @@ class DDPMMSELossMod(DDPMLossMod):
                  data_info=None,
                  loss_name='loss_ddpm_mse',
                  scale_norm=False,
+                 p_uncond=0.5,
+                 num_timesteps=1000,
                  momentum=0.001):
         super().__init__(rescale_mode=rescale_mode,
                          rescale_cfg=rescale_cfg,
@@ -174,6 +176,8 @@ class DDPMMSELossMod(DDPMLossMod):
         self.data_info = self._default_data_info \
             if data_info is None else data_info
 
+        self.num_timesteps = num_timesteps
+        self.p_uncond = p_uncond
         self.loss_fn = partial(mse_loss, reduction='flatmean')
         self.scale_norm = scale_norm
         self.freeze_norm = False
@@ -206,16 +210,16 @@ class DDPMMSELossMod(DDPMLossMod):
             loss = loss / self.norm_factor
         return loss
 
-    def _forward_loss(self, outputs_dict):
+    def _forward_loss(self, output_dict):
         """Compute loss.
         If Gaussian-mixture keys are present, compute both conditional and
         unconditional u_t losses as requested; otherwise, fall back to
         vanilla MSE between ``pred`` and ``target`` from ``data_info``.
         """
-        has_gm = all(k in outputs_dict for k in ("means", "logweights", "logstds"))
+        has_gm = all(k in output_dict for k in ("means", "logweights", "logstds"))
         if not has_gm:
             # CHANGED: remove 0.5; match forward's "no scaling", and rescale on return.
-            loss_input_dict = {k: outputs_dict[v] for k, v in self.data_info.items()}
+            loss_input_dict = {k: output_dict[v] for k, v in self.data_info.items()}
             pred = loss_input_dict.get('pred')
             target = loss_input_dict.get('target')
             if isinstance(pred, torch.Tensor) and isinstance(target, torch.Tensor):
@@ -234,8 +238,8 @@ class DDPMMSELossMod(DDPMLossMod):
 
 
         # 1) Conditional u_t prediction from mixture mean
-        means = outputs_dict["means"]  # (B,*,G,C,H,W) or (B,G,C,H,W)
-        logweights = outputs_dict["logweights"]
+        means = output_dict["means"]  # (B,*,G,C,H,W) or (B,G,C,H,W)
+        logweights = output_dict["logweights"]
         # normalize dims and compute softmax over Gaussian axis (-4)
         while logweights.dim() < means.dim():
             logweights = logweights.unsqueeze(-1)
@@ -243,30 +247,30 @@ class DDPMMSELossMod(DDPMLossMod):
         u_t_pred = (means * w).sum(dim=-4)  # (B,*,C,H,W)
 
         # target u_t = noise - x_0 (provided by GaussianFlow) or reconstruct
-        if "u_t" in outputs_dict:
-            u_t_tgt = outputs_dict["u_t"]
+        if "u_t" in output_dict:
+            u_t_tgt = output_dict["u_t"]
         else:
-            assert all(k in outputs_dict for k in ("noise", "x_0")), (
+            assert all(k in output_dict for k in ("noise", "x_0")), (
                 "Need either 'u_t' or both 'noise' and 'x_0' in outputs_dict")
-            u_t_tgt = outputs_dict["noise"] - outputs_dict["x_0"]
+            u_t_tgt = output_dict["noise"] - output_dict["x_0"]
 
         # CHANGED: keep a raw part for logging; weight by (1 - p_uncond) only for the total.
-        loss_cond_raw = self.loss_fn(pred=u_t_pred, target=u_t_tgt)
+        loss_cond_raw = self.loss_fn(pred=u_t_pred, target=u_t_tgt) * 0.5
         loss_cond = loss_cond_raw * (1.0 - self.p_uncond)
 
         # 2) Unconditional term (if uncond_* present):
         loss_uncond = None
         loss_uncond_raw = None
-        has_uncond = "uncond_mean" in outputs_dict # all(k in outputs_dict for k in ("uncond_means", "uncond_logweights", "uncond_logstds"))
+        has_uncond = "uncond_mean" in output_dict # all(k in outputs_dict for k in ("uncond_means", "uncond_logweights", "uncond_logstds"))
         if has_uncond:
-            u_uncond_pred = outputs_dict["uncond_mean"]
+            u_uncond_pred = output_dict["uncond_mean"]
 
             # Build target: E_{posterior}[ (x0 - x_t)/sigma ] over batch x0 bank
-            assert all(k in outputs_dict for k in ("x_0", "noise", "timesteps", "x_t"))
-            x_t = outputs_dict["x_t"]
-            x0_bank = outputs_dict["x_0"]  # (B,C,H,W) treated as candidate set
-            timesteps = outputs_dict["timesteps"].to(x0_bank.dtype)
-            T = float(self.num_timesteps_cfg if self.num_timesteps_cfg is not None else 1000)
+            assert all(k in output_dict for k in ("x_0", "noise", "timesteps", "x_t"))
+            x_t = output_dict["x_t"]
+            x0_bank = output_dict["x_0"]  # (B,C,H,W) treated as candidate set
+            timesteps = output_dict["timesteps"].to(x0_bank.dtype)
+            T = float(self.num_timesteps if self.num_timesteps is not None else 1000)
 
             log_probs, vector_field = compute_posterior_x0_given_xt(
                 x_t=x_t,
@@ -279,24 +283,21 @@ class DDPMMSELossMod(DDPMLossMod):
             u_uncond_tgt = (probs * vector_field).sum(dim=1)  # (B,C,H,W)
 
             # CHANGED: keep a raw part for logging; weight by p_uncond only for the total.
-            loss_uncond_raw = self.loss_fn(pred=u_uncond_pred, target=u_uncond_tgt)
+            loss_uncond_raw = self.loss_fn(pred=u_uncond_pred, target=u_uncond_tgt) * 0.5
             loss_uncond = loss_uncond_raw * self.p_uncond
 
         # Total loss: sum available parts (weighted by p_uncond)
         loss = loss_cond if loss_uncond is None else (loss_cond + loss_uncond)
 
-        # CHANGED: rescale only at the end, like forward()
-        loss_rescaled = loss * self.weight_scale
-
         # Expose parts for logging: match forward() by logging the RAW parts times weight_scale
         to_log = dict(
-            loss_cond=reduce_loss(loss_cond_raw * self.weight_scale, self.reduction).item()
+            loss_cond=reduce_loss(loss_cond_raw, self.reduction).item()
         )
         if loss_uncond_raw is not None:
-            to_log["loss_uncond"] = reduce_loss(loss_uncond_raw * self.weight_scale, self.reduction).item()
+            to_log["loss_uncond"] = reduce_loss(loss_uncond_raw, self.reduction).item()
         self.log_vars.update(**to_log)
 
-        return reduce_loss(loss_rescaled, self.reduction)
+        return reduce_loss(loss, self.reduction)
 
 
 @MODULES.register_module()

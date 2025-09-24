@@ -1,5 +1,5 @@
 # 512 samples per gpu, requires 40GB VRAM
-name = 'fm_imagenet_k8_8gpus'
+name = 'sscfg_fm_imagenet_k8_8gpus'
 
 model = dict(
     type='LatentDiffusionClassImage',
