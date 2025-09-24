@@ -31,7 +31,7 @@ model = dict(
             type='GMFlowHybridLoss',
             log_cfgs=dict(type='quartile', prefix_name='loss_trans', total_timesteps=1000),
             data_info=None,
-            p_uncond=0.25,
+            p_uncond=0.4,
             weight_scale=2.0),
         num_timesteps=1000,
         timestep_sampler=dict(type='ContinuousTimeStepSampler', shift=1.0, logit_normal_enable=True),
@@ -70,7 +70,7 @@ data = dict(
         type='ImageNet',
         data_root='data/imagenet/train_cache',
         datalist_path='data/imagenet/train_cache.txt'),
-    train_dataloader=dict(samples_per_gpu=128),
+    train_dataloader=dict(samples_per_gpu=256),
     val=dict(
         num_test_images=10_000,
         type='ImageNet',
@@ -152,7 +152,7 @@ runner = dict(
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
 load_from = None
-resume_from = f'checkpoints/{name}/latest.pth'  # resume by default
+resume_from = "/data/single-step-cfg/checkpoints/gmflow_imagenet_k8_train/iter_95000.pth" # f'checkpoints/{name}/latest.pth'  # resume by default
 workflow = [('train', save_interval)]
 use_ddp_wrapper = True
 find_unused_parameters = False

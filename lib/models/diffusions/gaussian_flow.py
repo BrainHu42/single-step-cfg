@@ -15,6 +15,7 @@ from mmgen.models.diffusions.utils import _get_noise_batch
 
 from . import schedulers
 from lib.ops.gmflow_ops.gmflow_ops import gm_to_mean, gm_to_sample
+from lib.models.losses import DDPMMSELossMod
 
 
 @torch.jit.script
@@ -89,6 +90,15 @@ class GaussianFlow(nn.Module):
                     raise AttributeError('Unknown denoising output type '
                                          f'[{type(denoising_output)}].')
                 loss_kwargs.update(u_t=noise - x_0)
+
+                if isinstance(self.flow_loss, DDPMMSELossMod):
+                    pred_key = getattr(self.flow_loss, 'data_info', dict()).get('pred')
+                    if pred_key in loss_kwargs:
+                        pred_tensor = loss_kwargs[pred_key]
+                        if (isinstance(pred_tensor, torch.Tensor)
+                                and pred_tensor.dim() == 5
+                                and pred_tensor.size(1) == 1):
+                            loss_kwargs[pred_key] = pred_tensor.squeeze(1)
             else:
                 raise AttributeError('Unknown denoising mean output type '
                                      f'[{self.denoising_mean_mode}].')

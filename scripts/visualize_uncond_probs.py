@@ -34,7 +34,7 @@ Examples
 
 - ImageNet (dataset mode):
   python scripts/visualize_uncond_probs.py --mode dataset --dataset imagenet \
-      --imagenet-root data/imagenet/train --datalist data/imagenet/train.txt \
+      --imagenet-root data/imagenet/train_cache --datalist data/imagenet/train_cache.txt \
       --label2name data/imagenet/imagenet1000_clsidx_to_labels.txt \
       --batch-size 16 --image-size 256 --num-timesteps 1000 --trans-ratio 0.5 \
       --save heatmap.png --tau 1.0
@@ -217,36 +217,92 @@ def main() -> None:
         # Compute exact posterior over x0 candidates (columns are x0[j])
         loss_mod = GMFlowHybridLoss(p_uncond=1.0, top_k=args.top_k).to(device)
         with torch.no_grad():
-            out1, out2 = loss_mod.compute_posterior_x0_given_xt(
+            posterior = loss_mod.compute_posterior_x0_given_xt(
                 x_t=x_t_high,
                 x0_bank=x0,
                 timesteps=t_high,
                 num_timesteps=float(T),
-                top_k=args.top_k,
-                temperature=float(args.post_temperature),
-                sigma_extra=float(args.post_sigma_extra),
             )
-        # Prefer the 2D tensor as log-probs; swap if needed
+
         import torch as _torch
-        if hasattr(out1, 'dim') and out1.dim() == 2:
-            logp = out1
-        elif hasattr(out2, 'dim') and out2.dim() == 2:
-            logp = out2
+
+        if isinstance(posterior, (list, tuple)) and len(posterior) == 2:
+            out1, out2 = posterior
         else:
-            # Fall back: if both are >2D, attempt to reduce over channel/spatial dims.
-            # This keeps the script usable even if an unexpected signature is returned.
-            cand = out1 if hasattr(out1, 'dim') else out2
-            if cand.dim() >= 3:
-                # Expect shape (B, N, C, H, W) → sum over C,H,W to get (B,N)
-                logp = cand
-                # Avoid negative dims ambiguity for 1D/2D
-                reduce_dims = tuple(range(2, cand.dim()))
-                logp = cand.sum(dim=reduce_dims)
-                # Normalize row-wise
-                logp = _torch.log_softmax(logp, dim=1)
-            else:
-                raise RuntimeError(f"Unexpected outputs from compute_posterior_x0_given_xt: shapes = {tuple(getattr(out1,'shape',()))}, {tuple(getattr(out2,'shape',()))}")
+            raise RuntimeError(
+                "compute_posterior_x0_given_xt expected to return (log_probs, vector_field)"
+            )
+
+        logp = None
+        vector_field = None
+        for candidate in (out1, out2):
+            if not hasattr(candidate, "dim"):
+                continue
+            if candidate.dim() == 2 and logp is None:
+                logp = candidate
+            elif candidate.dim() >= 3 and vector_field is None:
+                vector_field = candidate
+
+        if logp is None or vector_field is None:
+            # Fall back: if both tensors share the same dimensionality (>2D),
+            # reduce one copy to obtain row-wise log-probabilities.
+            fallback = out1 if hasattr(out1, "dim") else out2
+            if not hasattr(fallback, "dim") or fallback.dim() < 3:
+                raise RuntimeError(
+                    "Unexpected outputs from compute_posterior_x0_given_xt: "
+                    f"shapes = {tuple(getattr(out1,'shape',()))}, {tuple(getattr(out2,'shape',()))}"
+                )
+            reduce_dims = tuple(range(2, fallback.dim()))
+            logp = fallback.sum(dim=reduce_dims)
+            logp = _torch.log_softmax(logp, dim=1)
+            vector_field = fallback
         # Quick checks for uniformity when tau=1.0 (t_high == T)
+        # Expected velocity: E[(x0 - eps_hat) | x_t] using posterior weights
+        probs = logp.exp()  # (B, N)
+        extra_dims = vector_field.dim() - probs.dim()
+        if extra_dims > 0:
+            probs_reshaped = probs.reshape(probs.shape + (1,) * extra_dims)
+        else:
+            probs_reshaped = probs
+        expected_velocity = (probs_reshaped * vector_field).sum(dim=1)  # (B, C, H, W) or (B, D)
+
+        # Ground-truth conditional velocity: x1 - x0 with x1 reconstructed from x_t_high
+        sigma_h_safe = sigma_h.clamp_min(1e-8)
+        eps_true = (x_t_high - mean_h * x0) / sigma_h_safe
+        conditional_velocity = x0 - eps_true
+
+        # Diagnostics comparing the two velocity estimates
+        diff = expected_velocity - conditional_velocity
+        exp_flat = expected_velocity.flatten(1)
+        cond_flat = conditional_velocity.flatten(1)
+        diff_flat = diff.flatten(1)
+
+        exp_norm = exp_flat.norm(dim=1)
+        cond_norm = cond_flat.norm(dim=1)
+        dot = (exp_flat * cond_flat).sum(dim=1)
+        denom = (exp_norm * cond_norm).clamp_min(1e-8)
+        cosine = dot / denom
+        mae = diff_flat.abs().mean(dim=1)
+        rmse = diff_flat.pow(2).mean(dim=1).sqrt()
+        norm_ratio = exp_norm / cond_norm.clamp_min(1e-8)
+
+        print(
+            "[stats] velocity expectation cosine (mean ± std): "
+            f"{float(cosine.mean()):.4f} ± {float(cosine.std(unbiased=False)):.4f}"
+        )
+        print(
+            "[stats] velocity MAE vs conditional (mean ± std): "
+            f"{float(mae.mean()):.6f} ± {float(mae.std(unbiased=False)):.6f}"
+        )
+        print(
+            "[stats] velocity RMSE vs conditional (mean ± std): "
+            f"{float(rmse.mean()):.6f} ± {float(rmse.std(unbiased=False)):.6f}"
+        )
+        print(
+            "[stats] velocity norm ratio (expected / conditional mean ± std): "
+            f"{float(norm_ratio.mean()):.4f} ± {float(norm_ratio.std(unbiased=False)):.4f}"
+        )
+
         if args.tau is not None and float(args.tau) == 1.0 and args.top_k is None:
             # Expect t_high == T exactly
             th = t_high.detach()

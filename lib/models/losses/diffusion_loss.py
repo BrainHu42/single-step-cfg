@@ -218,6 +218,20 @@ class DDPMMSELossMod(DDPMLossMod):
             k: outputs_dict[v]
             for k, v in self.data_info.items()
         }
+
+        pred = loss_input_dict.get('pred')
+        target = loss_input_dict.get('target')
+        if isinstance(pred, torch.Tensor) and isinstance(target, torch.Tensor):
+            if pred.shape != target.shape and pred.dim() > target.dim():
+                squeezed = pred
+                while squeezed.dim() > target.dim():
+                    dim_to_squeeze = next((i for i, size in enumerate(squeezed.shape)
+                                            if size == 1), None)
+                    if dim_to_squeeze is None:
+                        break
+                    squeezed = squeezed.squeeze(dim_to_squeeze)
+                if squeezed.shape == target.shape:
+                    loss_input_dict['pred'] = squeezed
         loss = self.loss_fn(**loss_input_dict) * 0.5
         return loss
 
@@ -505,18 +519,12 @@ class GMFlowHybridLoss(FlowNLLLoss):
         logstds    = output_dict["logstds"]      # broadcastable to (B,K,G,C,H,W)
         logweights = output_dict["logweights"]   # (B,G,1,H,W) or (B,K,G,1,H,W)
 
-        uncond_means      = output_dict["uncond_means"]
-        uncond_logstds    = output_dict["uncond_logstds"]
-        uncond_logweights = output_dict["uncond_logweights"]
+        uncond_mean = output_dict["uncond_mean"]
 
         # Normalize shapes to (B,K,G,C,H,W)
         means      = self._ensure_K_axis(means,      name="means")
         logstds    = self._ensure_K_axis(logstds,    name="logstds")
         logweights = self._ensure_K_axis(logweights, name="logweights")
-
-        uncond_means      = self._ensure_K_axis(uncond_means,      name="uncond_means")
-        uncond_logstds    = self._ensure_K_axis(uncond_logstds,    name="uncond_logstds")
-        uncond_logweights = self._ensure_K_axis(uncond_logweights, name="uncond_logweights")
 
         # 1) Conditional KL in x_t_low-space (K=1)
         x_t_low = output_dict["x_t_low"]               # (B,C,H,W)
@@ -543,33 +551,49 @@ class GMFlowHybridLoss(FlowNLLLoss):
             assert not missing, f"Missing keys for uncond loss: {missing}"
 
             # Compute posterior over candidates x_{t_low}
-            uncond_log_probs, _ = self.compute_posterior_x0_given_xt(
+            uncond_log_probs, _ = compute_posterior_x0_given_xt(
                 x_t=output_dict['x_t'],
                 x0_bank=output_dict['x_0'],
                 timesteps=output_dict['timesteps'],
                 num_timesteps=output_dict['num_timesteps'],
             )
 
-            # If your gm_kl_divergence requires explicit K=N (no implicit broadcast), expand:
             B, N = uncond_log_probs.shape
-            def _expand_K(x: torch.Tensor) -> torch.Tensor:
-                if x.size(1) == 1:
-                    return x.expand(B, N, *x.shape[2:])
-                if x.size(1) == N:
-                    return x
-                raise ValueError(f"Pred tensor K={x.size(1)} incompatible with N={N}")
-            uncond_means_e      = _expand_K(uncond_means)
-            uncond_logstds_e    = _expand_K(uncond_logstds)
-            uncond_logweights_e = _expand_K(uncond_logweights)
 
-            uncond_loss = gm_kl_divergence(
-                target=output_dict["x_t_low_matrix"],   # (N,C,H,W) or (B,N,C,H,W)
-                true_log_probs=uncond_log_probs,        # (B,N)
-                pred_means=uncond_means_e,              # (B,N,G,C,H,W)
-                pred_logstds=uncond_logstds_e,          # broadcastable
-                pred_logweights=uncond_logweights_e,    # (B,N,G,1,H,W)
-                reduction="flatmean",
-            )  # (B,)
+            # Prepare predicted unconditional mean (B,C,H,W)
+            if uncond_mean.dim() == 4:
+                uncond_pred = uncond_mean
+            elif uncond_mean.dim() == 5:
+                if uncond_mean.size(1) == 1:
+                    uncond_pred = uncond_mean.squeeze(1)
+                else:
+                    raise ValueError(
+                        f"uncond_mean has incompatible K dimension {uncond_mean.size(1)}; expected 1 or absent")
+            else:
+                raise ValueError(f"uncond_mean must be 4D or 5D, got shape {tuple(uncond_mean.shape)}")
+
+            # Ensure candidate bank matches batch dimension
+            x_t_low_matrix = output_dict["x_t_low_matrix"]
+            if x_t_low_matrix.dim() == 4:
+                x_t_low_matrix = x_t_low_matrix.unsqueeze(0).expand(B, -1, -1, -1, -1)
+            elif x_t_low_matrix.dim() == 5:
+                if x_t_low_matrix.size(0) != B:
+                    raise ValueError(
+                        f"x_t_low_matrix batch dimension {x_t_low_matrix.size(0)} != {B}")
+            else:
+                raise ValueError(
+                    f"x_t_low_matrix expected 4D or 5D tensor, got shape {tuple(x_t_low_matrix.shape)}")
+
+            # Use a stabilized softmax from log probabilities to avoid overflow/underflow.
+            log_w = uncond_log_probs
+            log_w = log_w - log_w.max(dim=1, keepdim=True).values
+            weights = log_w.exp()
+            weights = weights / weights.sum(dim=1, keepdim=True)
+            weights = weights.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+            target_mean = (weights * x_t_low_matrix).sum(dim=1)
+
+            diff = uncond_pred - target_mean
+            uncond_loss = diff.flatten(1).square().mean(dim=1)
         else:
             uncond_loss = torch.zeros_like(cond_loss)
 
@@ -603,99 +627,108 @@ class GMFlowHybridLoss(FlowNLLLoss):
 
         return reduce_loss(loss_rescaled, self.reduction)
 
-    @torch.no_grad()
-    def compute_posterior_x0_given_xt(self,
-                                      x_t: torch.Tensor,
-                                      x0_bank: torch.Tensor,
-                                      timesteps: torch.Tensor,
-                                      num_timesteps: float,
-                                      log_prior: Optional[torch.Tensor] = None,
-                                      top_k: Optional[int] = None,
-                                      temperature: float = 1.0,
-                                      sigma_extra: float = 0.0,
-                                      eps: float = 1e-12):
-        """
-        Exact single-step posterior over discrete x0 candidates under the linear forward kernel:
-            x_t = alpha x_0 + sigma * eps, eps ~ N(0, I).
+@torch.no_grad()
+def compute_posterior_x0_given_xt(
+    x_t: torch.Tensor,
+    x0_bank: torch.Tensor,
+    timesteps: torch.Tensor,
+    num_timesteps: float,
+    log_prior: Optional[torch.Tensor] = None,
+    top_k: Optional[int] = None,
+    temperature: float = 1.0,
+    sigma_extra: float = 0.0,
+    eps: float = 1e-12,
+):
+    """
+    Exact single-step posterior over discrete x0 candidates under the linear forward kernel:
+        x_t = alpha x_0 + sigma * eps,  eps ~ N(0, I), with alpha = 1 - t/T, sigma = t/T.
 
-        p(j | x_t, t) ∝ p(x_t | x0_j, t) · p(j) with
-            log p(x_t | x0_j, t) = −0.5 / sigma^2 · ||x_t − alpha x0_j||^2 − 0.5 D log(2π sigma^2).
+    p(j | x_t, t) ∝ p(x_t | x0_j, t) · p(j) with
+        log p(x_t | x0_j, t) = −0.5 / sigma^2 · ||x_t − alpha x0_j||^2 − 0.5 D log(2π sigma^2).
 
-        Inputs
-        - x_t: (B, C, H, W)
-        - x0_bank: (N, C, H, W) or (B, C, H, W) interpreted as N=B
-        - timesteps: (B,) integer or float in [0, T]
-        - num_timesteps: scalar T
-        - log_prior: optional (N,) or (B, N) log p(j); defaults to uniform
-        - top_k: optional int; return only Top-K per row
-        - temperature: softmax temperature τ; τ>1 smooths
-        - sigma_extra: extra noise std added in quadrature for smoothing/mismatch
+    Inputs
+    - x_t: (B, C, H, W)
+    - x0_bank: (N, C, H, W) or (B, C, H, W) interpreted as N=B
+    - timesteps: (B,) integer or float in [0, T]
+    - num_timesteps: scalar T
+    - log_prior: optional (N,) or (B, N) log p(j); defaults to uniform
+    - top_k: optional int; return only Top-K per row
+    - temperature: softmax temperature τ; τ>1 smooths
+    - sigma_extra: extra noise std added in quadrature for smoothing/mismatch
 
-        Returns
-        - log_probs: (B, K) if top_k else (B, N) row-wise log-softmax
-        - eps_hat:   (B, K, C, H, W) if top_k else (B, N, C, H, W) estimated noise per candidate
-        """
-        if temperature <= 0:
-            raise ValueError(f"temperature must be positive, got {temperature}")
-        if sigma_extra < 0:
-            raise ValueError(f"sigma_extra must be >= 0, got {sigma_extra}")
+    Returns
+    - log_probs:   (B, K) if top_k else (B, N) row-wise log-softmax
+    - vector_field:(B, K, C, H, W) if top_k else (B, N, C, H, W) where
+                vector_field[i, j] = (x0_j − x_t[i]) / sigma(t[i])
 
-        B = x_t.size(0)
-        D = x_t[0].numel()
-        device = x_t.device
-        dtype = x_t.dtype
+    Note: This matches the vector field from `compute_posterior_x1_given_xt`
+            under the identification x1 ≡ x0 and t(second)=alpha=1−t/T.
+    """
+    if temperature <= 0:
+        raise ValueError(f"temperature must be positive, got {temperature}")
+    if sigma_extra < 0:
+        raise ValueError(f"sigma_extra must be >= 0, got {sigma_extra}")
 
-        # Candidate axis length N
-        if x0_bank.dim() != x_t.dim():
-            raise ValueError(f"x0_bank must have same dims as x_t; got {x0_bank.shape} vs {x_t.shape}")
-        N = x0_bank.size(0)
+    B = x_t.size(0)
+    D = x_t[0].numel()
+    device = x_t.device
+    dtype = x_t.dtype
 
-        # Compute alpha_t and sigma_t
-        T = float(num_timesteps)
-        t = timesteps.to(torch.float32)  # (B,)
-        alpha = (1.0 - t / T).to(dtype).view(B, 1, *([1] * (x_t.dim() - 1)))  # (B,1,1,1)
-        sigma = (t / T).to(dtype).view(B, 1, *([1] * (x_t.dim() - 1))).clamp_min(eps)
-        sigma2_eff = sigma.square() + (torch.tensor(float(sigma_extra), dtype=dtype, device=device) ** 2)
+    # Candidate axis length N
+    if x0_bank.dim() != x_t.dim():
+        raise ValueError(f"x0_bank must have same dims as x_t; got {x0_bank.shape} vs {x_t.shape}")
+    N = x0_bank.size(0)
 
-        # Broadcast x_t and candidates
-        xt_b = x_t.unsqueeze(1)                          # (B,1,C,H,W)
-        x0_cols = x0_bank.unsqueeze(0).expand(B, N, *x0_bank.shape[1:])  # (B,N,...)
+    # Compute alpha_t and sigma_t
+    T = float(num_timesteps)
+    t = timesteps.to(torch.float32)  # (B,)
+    alpha = (1.0 - t / T).to(dtype).view(B, 1, *([1] * (x_t.dim() - 1)))  # (B,1,1,1)
+    sigma = (t / T).to(dtype).view(B, 1, *([1] * (x_t.dim() - 1))).clamp_min(eps)
+    sigma2_eff = sigma.square() + (torch.tensor(float(sigma_extra), dtype=dtype, device=device) ** 2)
 
-        # Residual and noise estimate
-        resid = xt_b - alpha * x0_cols                   # (B,N,C,H,W)
-        eps_hat = resid / sigma                          # (B,N,C,H,W)
+    # Broadcast x_t and candidates
+    xt_b = x_t.unsqueeze(1)  # (B,1,C,H,W)
+    x0_cols = x0_bank.unsqueeze(0).expand(B, N, *x0_bank.shape[1:])  # (B,N,...)
 
-        # Log-likelihood up to constants; include constant for completeness (cancels in softmax)
-        quad = (resid * resid).sum(dim=tuple(range(- (x_t.dim() - 1), 0)))  # (B,N)
-        log_two_pi = torch.log(torch.tensor(2.0 * torch.pi, dtype=dtype, device=device))
-        # Collapse per-row sigma^2 to shape (B,1) to avoid accidental broadcasting over B
-        sigma2_row = sigma2_eff.view(B, -1)[:, :1]                           # (B,1)
-        log_const = 0.5 * D * (torch.log(sigma2_row) + log_two_pi)           # (B,1)
-        logits = -(0.5 * quad / sigma2_row) - log_const                      # (B,N)
+    # Residual and noise estimate
+    resid = xt_b - alpha * x0_cols         # (B,N,C,H,W)
+    eps_hat = resid / sigma                # (B,N,C,H,W)
 
-        # Add log prior if provided
-        if log_prior is not None:
-            if log_prior.dim() == 1:
-                if log_prior.size(0) != N:
-                    raise ValueError(f"log_prior length {log_prior.size(0)} != N={N}")
-                logits = logits + log_prior.view(1, N)
-            elif log_prior.dim() == 2:
-                if log_prior.shape != logits.shape:
-                    raise ValueError(f"log_prior shape {tuple(log_prior.shape)} != {tuple(logits.shape)}")
-                logits = logits + log_prior
-            else:
-                raise ValueError("log_prior must be (N,) or (B,N)")
+    # === NEW: vector field matching compute_posterior_x1_given_xt ===
+    # (x0 - x_t) / sigma  ==  x0 - eps_hat   because alpha + sigma = 1
+    vector_field = x0_cols - eps_hat       # (B,N,C,H,W)
 
-        # Temperature smoothing and normalization
-        log_probs = torch.log_softmax(logits / float(temperature), dim=1)     # (B,N)
+    # Log-likelihood (row-wise constants included; cancel in softmax)
+    quad = (resid * resid).sum(dim=tuple(range(- (x_t.dim() - 1), 0)))  # (B,N)
+    log_two_pi = torch.log(torch.tensor(2.0 * torch.pi, dtype=dtype, device=device))
+    sigma2_row = sigma2_eff.view(B, -1)[:, :1]                           # (B,1)
+    log_const = 0.5 * D * (torch.log(sigma2_row) + log_two_pi)           # (B,1)
+    logits = -(0.5 * quad / sigma2_row) - log_const                      # (B,N)
 
-        if top_k is not None:
-            k = int(top_k)
-            if k <= 0:
-                raise ValueError(f"top_k must be positive, got {k}")
-            k = min(k, N)
-            top_vals, top_idx = torch.topk(log_probs, k=k, dim=1)            # (B,K)
-            batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(B, k)
-            eps_topk = eps_hat[batch_idx, top_idx]                            # (B,K,...)
-            return top_vals, eps_topk
-        return log_probs, eps_hat
+    # Add log prior if provided
+    if log_prior is not None:
+        if log_prior.dim() == 1:
+            if log_prior.size(0) != N:
+                raise ValueError(f"log_prior length {log_prior.size(0)} != N={N}")
+            logits = logits + log_prior.view(1, N)
+        elif log_prior.dim() == 2:
+            if log_prior.shape != logits.shape:
+                raise ValueError(f"log_prior shape {tuple(log_prior.shape)} != {tuple(logits.shape)}")
+            logits = logits + log_prior
+        else:
+            raise ValueError("log_prior must be (N,) or (B,N)")
+
+    # Temperature smoothing and normalization
+    log_probs = torch.log_softmax(logits / float(temperature), dim=1)     # (B,N)
+
+    if top_k is not None:
+        k = int(top_k)
+        if k <= 0:
+            raise ValueError(f"top_k must be positive, got {k}")
+        k = min(k, N)
+        top_vals, top_idx = torch.topk(log_probs, k=k, dim=1)             # (B,K)
+        batch_idx = torch.arange(B, device=device).unsqueeze(1).expand(B, k)
+        vf_topk = vector_field[batch_idx, top_idx]                         # (B,K,...)
+        return top_vals, vf_topk
+
+    return log_probs, vector_field
