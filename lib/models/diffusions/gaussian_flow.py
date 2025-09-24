@@ -79,7 +79,7 @@ class GaussianFlow(nn.Module):
         return output
 
     @force_fp32()
-    def loss(self, denoising_output, x_0, noise, t, pred_mask=None):
+    def loss(self, denoising_output, x_0, noise, t, x_t, pred_mask=None):
         with torch.autocast(device_type='cuda', enabled=False):
             if self.denoising_mean_mode.upper() == 'U':
                 if isinstance(denoising_output, dict):
@@ -103,6 +103,7 @@ class GaussianFlow(nn.Module):
                 raise AttributeError('Unknown denoising mean output type '
                                      f'[{self.denoising_mean_mode}].')
             loss_kwargs.update(
+                x_t=x_t,
                 x_0=x_0,
                 noise=noise,
                 timesteps=t,
@@ -127,7 +128,7 @@ class GaussianFlow(nn.Module):
         x_t, _, _ = self.sample_forward_diffusion(x_0, t, noise)
 
         denoising_output = self.pred(x_t, t, **kwargs)
-        loss = self.loss(denoising_output, x_0, noise, t)
+        loss = self.loss(denoising_output, x_0, noise, t, x_t)
         log_vars = self.flow_loss.log_vars
         log_vars.update(loss_diffusion=float(loss.detach()))
 

@@ -1116,11 +1116,7 @@ class GMFlowSSCFG(GMFlow):
                         logstds=gm_output["logstds"],
                     )
                     uncond_mean = gm_output["uncond_mean"]
-                    
-                    print((gm_to_mean(gm_cond) - uncond_mean).norm())
-                    
                     bias = guidance_jit(gm_to_mean(gm_cond), uncond_mean, guidance_scale, orthogonal_guidance)
-                    
                 
                     gm_output = dict(
                         means=gm_cond['means'] + bias.unsqueeze(-4),
