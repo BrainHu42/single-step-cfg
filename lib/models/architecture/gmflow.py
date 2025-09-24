@@ -496,16 +496,10 @@ class _GMDiTTransformer2DModel_Uncond(DiTTransformer2DModel):
 
         # === NEW: unconditional head ===
         self.uncond_proj_out_1 = nn.Linear(self.inner_dim, 2 * self.inner_dim)
+        self.uncond_channels = self.out_channels
         self.uncond_proj_out_2 = nn.Linear(
-            self.inner_dim, self.config.patch_size * self.config.patch_size * self.gm_channels)
-        self.uncond_gm_out = GMOutput2D(
-            num_gaussians,
-            self.out_channels,
             self.inner_dim,
-            constant_logstd=constant_logstd,
-            logstd_inner_dim=logstd_inner_dim,
-            num_logstd_layers=gm_num_logstd_layers,
-            activation_fn=self.config.activation_fn if hasattr(self.config, "activation_fn") else 'gelu-approximate'
+            self.config.patch_size * self.config.patch_size * self.uncond_channels,
         )
 
     # https://github.com/facebookresearch/DiT/blob/main/models.py
@@ -532,7 +526,6 @@ class _GMDiTTransformer2DModel_Uncond(DiTTransformer2DModel):
 
         # Init GM heads
         self.gm_out.init_weights()
-        self.uncond_gm_out.init_weights()  # NEW
 
     def forward(
             self,
@@ -604,20 +597,17 @@ class _GMDiTTransformer2DModel_Uncond(DiTTransformer2DModel):
         shift_u, scale_u = self.uncond_proj_out_1(F.silu(uncond_emb)).chunk(2, dim=1)
         hs_u = hs_norm * (1 + scale_u[:, None]) + shift_u[:, None]
         x_u = self.uncond_proj_out_2(hs_u).reshape(
-            bs, height, width, self.patch_size, self.patch_size, self.gm_channels
+            bs, height, width, self.patch_size, self.patch_size, self.uncond_channels
         ).permute(0, 5, 1, 3, 2, 4).reshape(
-            bs, self.gm_channels, height * self.patch_size, width * self.patch_size
+            bs, self.uncond_channels, height * self.patch_size, width * self.patch_size
         )
-        gm_u = self.uncond_gm_out(x_u, uncond_emb.detach())
 
         # 4) Return explicit, separate outputs
         return dict(
             means=gm_c['means'],
             logweights=gm_c['logweights'],
             logstds=gm_c['logstds'],
-            uncond_means=gm_u['means'],
-            uncond_logweights=gm_u['logweights'],
-            uncond_logstds=gm_u['logstds'],
+            uncond_mean=x_u,
         )
 
     

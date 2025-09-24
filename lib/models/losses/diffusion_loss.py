@@ -207,19 +207,82 @@ class DDPMMSELossMod(DDPMLossMod):
         return loss
 
     def _forward_loss(self, outputs_dict):
-        """Forward function for loss calculation.
-        Args:
-            outputs_dict (dict): Outputs of the model used to calculate losses.
-
-        Returns:
-            torch.Tensor: Calculated loss.
+        """Compute loss.
+        If Gaussian-mixture keys are present, compute both conditional and
+        unconditional u_t losses as requested; otherwise, fall back to
+        vanilla MSE between ``pred`` and ``target`` from ``data_info``.
         """
-        loss_input_dict = {
-            k: outputs_dict[v]
-            for k, v in self.data_info.items()
-        }
-        loss = self.loss_fn(**loss_input_dict) * 0.5
-        return loss
+        has_gm = all(k in outputs_dict for k in ("means", "logweights", "logstds"))
+        if not has_gm:
+            # CHANGED: remove 0.5; match forward's "no scaling", and rescale on return.
+            loss_input_dict = {k: outputs_dict[v] for k, v in self.data_info.items()}
+            loss = self.loss_fn(**loss_input_dict) * 0.5
+            return reduce_loss(loss * self.weight_scale, self.reduction)
+
+        # 1) Conditional u_t prediction from mixture mean
+        means = outputs_dict["means"]  # (B,*,G,C,H,W) or (B,G,C,H,W)
+        logweights = outputs_dict["logweights"]
+        # normalize dims and compute softmax over Gaussian axis (-4)
+        while logweights.dim() < means.dim():
+            logweights = logweights.unsqueeze(-1)
+        w = torch.softmax(logweights, dim=-4)
+        u_t_pred = (means * w).sum(dim=-4)  # (B,*,C,H,W)
+
+        # target u_t = noise - x_0 (provided by GaussianFlow) or reconstruct
+        if "u_t" in outputs_dict:
+            u_t_tgt = outputs_dict["u_t"]
+        else:
+            assert all(k in outputs_dict for k in ("noise", "x_0")), (
+                "Need either 'u_t' or both 'noise' and 'x_0' in outputs_dict")
+            u_t_tgt = outputs_dict["noise"] - outputs_dict["x_0"]
+
+        # CHANGED: keep a raw part for logging; weight by (1 - p_uncond) only for the total.
+        loss_cond_raw = self.loss_fn(pred=u_t_pred, target=u_t_tgt)
+        loss_cond = loss_cond_raw * (1.0 - self.p_uncond)
+
+        # 2) Unconditional term (if uncond_* present):
+        loss_uncond = None
+        loss_uncond_raw = None
+        has_uncond = "uncond_mean" in outputs_dict # all(k in outputs_dict for k in ("uncond_means", "uncond_logweights", "uncond_logstds"))
+        if has_uncond:
+            u_uncond_pred = outputs_dict["uncond_mean"]
+
+            # Build target: E_{posterior}[ (x0 - x_t)/sigma ] over batch x0 bank
+            assert all(k in outputs_dict for k in ("x_0", "noise", "timesteps", "x_t"))
+            x_t = outputs_dict["x_t"]
+            x0_bank = outputs_dict["x_0"]  # (B,C,H,W) treated as candidate set
+            timesteps = outputs_dict["timesteps"].to(x0_bank.dtype)
+            T = float(self.num_timesteps_cfg if self.num_timesteps_cfg is not None else 1000)
+
+            log_probs, vector_field = compute_posterior_x0_given_xt(
+                x_t=x_t,
+                x0_bank=x0_bank,
+                timesteps=timesteps,
+                num_timesteps=T,
+            )  # log_probs: (B,B), vector_field: (B,B,C,H,W)
+
+            probs = log_probs.softmax(dim=1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+            u_uncond_tgt = (probs * vector_field).sum(dim=1)  # (B,C,H,W)
+
+            # CHANGED: keep a raw part for logging; weight by p_uncond only for the total.
+            loss_uncond_raw = self.loss_fn(pred=u_uncond_pred, target=u_uncond_tgt)
+            loss_uncond = loss_uncond_raw * self.p_uncond
+
+        # Total loss: sum available parts (weighted by p_uncond)
+        loss = loss_cond if loss_uncond is None else (loss_cond + loss_uncond)
+
+        # CHANGED: rescale only at the end, like forward()
+        loss_rescaled = loss * self.weight_scale
+
+        # Expose parts for logging: match forward() by logging the RAW parts times weight_scale
+        to_log = dict(
+            loss_cond=reduce_loss(loss_cond_raw * self.weight_scale, self.reduction).item()
+        )
+        if loss_uncond_raw is not None:
+            to_log["loss_uncond"] = reduce_loss(loss_uncond_raw * self.weight_scale, self.reduction).item()
+        self.log_vars.update(**to_log)
+
+        return reduce_loss(loss_rescaled, self.reduction)
 
 
 @MODULES.register_module()
