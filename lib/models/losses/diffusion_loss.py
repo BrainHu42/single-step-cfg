@@ -625,19 +625,17 @@ class GMFlowHybridLoss(FlowNLLLoss):
 
         # 2) Unconditional KL over candidate targets
         if self.p_uncond > 0.0:
-            required = ("x_t", "x_t_low_matrix", "timesteps", "t_low", "num_timesteps")
+            required = ("x_t", "timesteps", "t_low", "num_timesteps", "x_0")
             missing = [k for k in required if k not in output_dict]
             assert not missing, f"Missing keys for uncond loss: {missing}"
 
             # Compute posterior over candidates x_{t_low}
-            uncond_log_probs, _ = compute_posterior_x0_given_xt(
+            uncond_log_probs, velocity_fields = compute_posterior_x0_given_xt(
                 x_t=output_dict['x_t'],
                 x0_bank=output_dict['x_0'],
                 timesteps=output_dict['timesteps'],
                 num_timesteps=output_dict['num_timesteps'],
             )
-
-            B, N = uncond_log_probs.shape
 
             # Prepare predicted unconditional mean (B,C,H,W)
             if uncond_mean.dim() == 4:
@@ -651,27 +649,11 @@ class GMFlowHybridLoss(FlowNLLLoss):
             else:
                 raise ValueError(f"uncond_mean must be 4D or 5D, got shape {tuple(uncond_mean.shape)}")
 
-            # Ensure candidate bank matches batch dimension
-            x_t_low_matrix = output_dict["x_t_low_matrix"]
-            if x_t_low_matrix.dim() == 4:
-                x_t_low_matrix = x_t_low_matrix.unsqueeze(0).expand(B, -1, -1, -1, -1)
-            elif x_t_low_matrix.dim() == 5:
-                if x_t_low_matrix.size(0) != B:
-                    raise ValueError(
-                        f"x_t_low_matrix batch dimension {x_t_low_matrix.size(0)} != {B}")
-            else:
-                raise ValueError(
-                    f"x_t_low_matrix expected 4D or 5D tensor, got shape {tuple(x_t_low_matrix.shape)}")
+            # Compute unconditional target as expectation over velocity fields
+            weights = uncond_log_probs.softmax(dim=1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+            uncond_target = (weights * velocity_fields).sum(dim=1)
 
-            # Use a stabilized softmax from log probabilities to avoid overflow/underflow.
-            log_w = uncond_log_probs
-            log_w = log_w - log_w.max(dim=1, keepdim=True).values
-            weights = log_w.exp()
-            weights = weights / weights.sum(dim=1, keepdim=True)
-            weights = weights.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-            target_mean = (weights * x_t_low_matrix).sum(dim=1)
-
-            diff = uncond_pred - target_mean
+            diff = uncond_pred - uncond_target
             uncond_loss = diff.flatten(1).square().mean(dim=1)
         else:
             uncond_loss = torch.zeros_like(cond_loss)
@@ -700,8 +682,8 @@ class GMFlowHybridLoss(FlowNLLLoss):
             self.collect_log(_loss, _var, timesteps=timesteps)
             # Append separate parts
             self.log_vars.update(
-                loss_cond=reduce_loss(cond_loss * self.weight_scale, self.reduction).item(),
-                loss_uncond=reduce_loss(uncond_loss * self.weight_scale, self.reduction).item(),
+                loss_cond=reduce_loss(cond_loss, self.reduction).item(),
+                loss_uncond=reduce_loss(uncond_loss, self.reduction).item(),
             )
 
         return reduce_loss(loss_rescaled, self.reduction)

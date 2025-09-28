@@ -991,7 +991,7 @@ class GMFlowSSCFG(GMFlow):
             loss_kwargs = {k: v for k, v in x_t_low_gm.items()}
             loss_kwargs.update(
                 x_t_low=x_t_low,
-                x_t_low_matrix=x_t_low_matrix,
+                # x_t_low_matrix=x_t_low_matrix,
                 timesteps=t_high,
                 t_low=t_low,
                 # For GMFlowHybridLoss uncond prior term
@@ -1024,11 +1024,11 @@ class GMFlowSSCFG(GMFlow):
             noise_0, noise_1 = torch.chunk(noise, 2, dim=0)
 
             x_t_low, _, _ = self.sample_forward_diffusion(x_0, t_low, noise_0)
-            x_t_low_matrix = self.sample_forward_diffusion_matrix(x_0, t_low, noise_0)
+            # x_t_low_matrix = self.sample_forward_diffusion_matrix(x_0, t_low, noise_0)
             x_t_high = self.sample_forward_transition(x_t_low, t_low, t_high, noise_1)
 
         denoising_output = self.pred(x_t_high, t_high, **kwargs)
-        loss = self.loss(denoising_output, x_t_low, x_t_high, t_low, t_high, x_t_low_matrix, x_0)
+        loss = self.loss(denoising_output, x_t_low, x_t_high, t_low, t_high, None, x_0)
         log_vars = self.flow_loss.log_vars
         log_vars.update(loss_transition=float(loss.detach()))
 
@@ -1108,7 +1108,8 @@ class GMFlowSSCFG(GMFlow):
             assert isinstance(gm_output, dict)
 
             if guidance_scale > 0.0:
-                if gm_output.get("uncond_means") is not None:   # separate gm
+                if gm_output.get("uncond_mean") is not None:   # separate gm
+                    gm_output = self.u_to_x_0(gm_output, x_t, t)
                     gm_cond = dict(
                         means=gm_output["means"],
                         logweights=gm_output["logweights"],
@@ -1122,8 +1123,6 @@ class GMFlowSSCFG(GMFlow):
                         logstds=gm_cond['logstds'],
                         logweights=gm_cond['logweights']
                     )
-                    
-                    gm_output = self.u_to_x_0(gm_output, x_t, t)
                     gaussian_output = gm_to_iso_gaussian(gm_output)[0]
                     gm_cond = gaussian_cond = avg_var = cfg_bias = None
                 
