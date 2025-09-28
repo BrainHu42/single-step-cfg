@@ -36,7 +36,7 @@ Examples
   python scripts/visualize_uncond_probs.py --mode dataset --dataset imagenet \
       --imagenet-root data/imagenet/train_cache --datalist data/imagenet/train_cache.txt \
       --label2name data/imagenet/imagenet1000_clsidx_to_labels.txt \
-      --batch-size 16 --image-size 256 --num-timesteps 1000 --trans-ratio 0.5 \
+      --batch-size 256 --image-size 256 --num-timesteps 1000 --trans-ratio 0.5 \
       --save heatmap.png --tau 1.0
 
 - File mode (.pt/.pth/.npy/.npz):
@@ -139,9 +139,9 @@ def main() -> None:
 
         import torch
         from lib.datasets import CheckerboardData, ImageNet, build_dataloader
-        from lib.models.losses.diffusion_loss import GMFlowHybridLoss
+        from lib.models.losses.diffusion_loss import GMFlowHybridLoss, compute_posterior_x0_given_xt
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = "cpu" # torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         if args.dataset == "checkerboard":
             # 2D toy data
@@ -217,7 +217,7 @@ def main() -> None:
         # Compute exact posterior over x0 candidates (columns are x0[j])
         loss_mod = GMFlowHybridLoss(p_uncond=1.0, top_k=args.top_k).to(device)
         with torch.no_grad():
-            posterior = loss_mod.compute_posterior_x0_given_xt(
+            posterior = compute_posterior_x0_given_xt(
                 x_t=x_t_high,
                 x0_bank=x0,
                 timesteps=t_high,

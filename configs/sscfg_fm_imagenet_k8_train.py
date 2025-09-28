@@ -21,7 +21,7 @@ model = dict(
             in_channels=4,
             num_layers=28,
             sample_size=32,  # 256
-            torch_dtype='bfloat16',
+            torch_dtype='float32',
             checkpointing=True),
         flow_loss=dict(
             type='DDPMMSELossMod',
@@ -43,7 +43,7 @@ total_iters = 100_000
 
 train_cfg = dict(
     trans_ratio=0.5,
-    prob_class=0.9,
+    prob_class=1.0,
     diffusion_grad_clip=10.0,
     diffusion_grad_clip_begin_iter=1000,
     grad_accum_steps=2,

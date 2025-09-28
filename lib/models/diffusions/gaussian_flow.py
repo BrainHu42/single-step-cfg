@@ -20,7 +20,7 @@ from lib.models.losses import DDPMMSELossMod
 
 @torch.jit.script
 def guidance_jit(pos_mean, neg_mean, guidance_scale: float, orthogonal: bool = False):
-    bias = (pos_mean - neg_mean) * (guidance_scale - 1)
+    bias = (pos_mean - neg_mean) * (guidance_scale)
     if orthogonal:
         bias = bias - (bias * pos_mean).mean(
             dim=(-3, -2, -1), keepdim=True
@@ -165,7 +165,7 @@ class GaussianFlow(nn.Module):
         sampler.set_timesteps(cfg.get('num_timesteps', self.num_timesteps), device=x_t.device)
         orthogonal_guidance = cfg.get('orthogonal_guidance', False)
         timesteps = sampler.timesteps
-        use_guidance = guidance_scale > 1.0
+        use_guidance = guidance_scale > 0.0
         num_batches = x_t.size(0)
 
         if show_pbar:
@@ -173,20 +173,24 @@ class GaussianFlow(nn.Module):
 
         for t in timesteps:
             x_t_input = x_t
-            if use_guidance:
-                x_t_input = torch.cat([x_t_input, x_t_input], dim=0)
+            # if use_guidance:
+            #     x_t_input = torch.cat([x_t_input, x_t_input], dim=0)
 
             denoising_output = self.pred(x_t_input, t, **kwargs)
 
             if isinstance(denoising_output, dict):  # for gmflow compatibility
                 if use_guidance:
-                    gm_pos = {k: v[num_batches:] for k, v in denoising_output.items()}
-                    gm_neg = {k: v[:num_batches] for k, v in denoising_output.items()}
-                    bias = guidance_jit(gm_to_mean(gm_pos), gm_to_mean(gm_neg), guidance_scale, orthogonal_guidance)
+                    uncond_mean = denoising_output.pop("uncond_mean")
+                    gm_cond = denoising_output
+                    
+                    diff = gm_to_mean(gm_cond) - uncond_mean
+                    print(torch.abs(diff).mean())
+                    
+                    bias = guidance_jit(gm_to_mean(gm_cond), uncond_mean, guidance_scale, orthogonal_guidance)
                     denoising_output = dict(
-                        means=gm_pos['means'] + bias.unsqueeze(-4),
-                        logstds=gm_pos['logstds'],
-                        logweights=gm_pos['logweights'])
+                        means=gm_cond['means'] + bias.unsqueeze(-4),
+                        logstds=gm_cond['logstds'],
+                        logweights=gm_cond['logweights'])
 
                 if output_mode == 'mean':
                     denoising_output = gm_to_mean(denoising_output)

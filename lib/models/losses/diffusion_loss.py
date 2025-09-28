@@ -216,7 +216,7 @@ class DDPMMSELossMod(DDPMLossMod):
         unconditional u_t losses as requested; otherwise, fall back to
         vanilla MSE between ``pred`` and ``target`` from ``data_info``.
         """
-        has_gm = all(k in output_dict for k in ("means", "logweights", "logstds"))
+        has_gm = all(k in output_dict for k in ("means", "logweights", "logstds", "uncond_mean"))
         if not has_gm:
             # CHANGED: remove 0.5; match forward's "no scaling", and rescale on return.
             loss_input_dict = {k: output_dict[v] for k, v in self.data_info.items()}
@@ -261,6 +261,8 @@ class DDPMMSELossMod(DDPMLossMod):
         # 2) Unconditional term (if uncond_* present):
         loss_uncond = None
         loss_uncond_raw = None
+        mse_u_tgt_vs_uncond_tgt = None
+        mse_u_pred_vs_uncond_pred = None
         has_uncond = "uncond_mean" in output_dict # all(k in outputs_dict for k in ("uncond_means", "uncond_logweights", "uncond_logstds"))
         if has_uncond:
             u_uncond_pred = output_dict["uncond_mean"]
@@ -280,7 +282,16 @@ class DDPMMSELossMod(DDPMLossMod):
             )  # log_probs: (B,B), vector_field: (B,B,C,H,W)
 
             probs = log_probs.softmax(dim=1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-            u_uncond_tgt = (probs * vector_field).sum(dim=1)  # (B,C,H,W)
+            u_uncond_tgt = -1 * (probs * vector_field).sum(dim=1)  # (B,C,H,W)
+
+            with torch.no_grad():
+                diff_targets = u_t_tgt - u_uncond_tgt
+                aligned_uncond_pred = u_uncond_pred
+                while aligned_uncond_pred.dim() < u_t_pred.dim():
+                    aligned_uncond_pred = aligned_uncond_pred.unsqueeze(1)
+                diff_preds = u_t_pred - aligned_uncond_pred
+                mse_u_tgt_vs_uncond_tgt = diff_targets.square().mean()
+                mse_u_pred_vs_uncond_pred = diff_preds.square().mean()
 
             # CHANGED: keep a raw part for logging; weight by p_uncond only for the total.
             loss_uncond_raw = self.loss_fn(pred=u_uncond_pred, target=u_uncond_tgt) * 0.5
@@ -295,6 +306,10 @@ class DDPMMSELossMod(DDPMLossMod):
         )
         if loss_uncond_raw is not None:
             to_log["loss_uncond"] = reduce_loss(loss_uncond_raw, self.reduction).item()
+        if mse_u_tgt_vs_uncond_tgt is not None:
+            to_log["mse_u_tgt_vs_uncond_tgt"] = mse_u_tgt_vs_uncond_tgt.item()
+        if mse_u_pred_vs_uncond_pred is not None:
+            to_log["mse_u_pred_vs_uncond_pred"] = mse_u_pred_vs_uncond_pred.item()
         self.log_vars.update(**to_log)
 
         return reduce_loss(loss, self.reduction)

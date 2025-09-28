@@ -1,4 +1,4 @@
-name = 'gmflow_imagenet_k8_test'
+name = 'sscfg_fm_imagenet_k8_test'
 
 model = dict(
     type='LatentDiffusionClassImage',
@@ -6,30 +6,33 @@ model = dict(
         type='PretrainedVAE',
         from_pretrained='stabilityai/sd-vae-ft-ema',
         freeze=True,
-        torch_dtype='bfloat16'),
+        torch_dtype='float16'),
     diffusion=dict(
-        type='GMFlow',
+        type='GaussianFlow',
         denoising=dict(
-            type='GMDiTTransformer2DModel',
-            num_gaussians=8,
+            type='GMDiTTransformer2DModel_Uncond',
+            num_gaussians=1,
+            constant_logstd=0.0,
             logstd_inner_dim=1024,
-            gm_num_logstd_layers=2,
+            gm_num_logstd_layers=1,
             num_attention_heads=16,
             attention_head_dim=72,
             in_channels=4,
             num_layers=28,
             sample_size=32,  # 256
-            torch_dtype='bfloat16'),
-        spectrum_net=dict(
-            type='SpectrumMLP',
-            base_size=(4, 32, 32),
-            layers=[64, 8],
-            torch_dtype='bfloat16'),
+            torch_dtype='float32',
+            checkpointing=True),
+        flow_loss=dict(
+            type='DDPMMSELossMod',
+            p_uncond=0.4,
+            # Let the loss compute u_t and uncond_u_t from mixture heads
+            num_timesteps=1000,
+            weight_scale=2.0),
         num_timesteps=1000,
-        timestep_sampler=dict(type='ContinuousTimeStepSampler', shift=1.0, logit_normal_enable=True),
+        timestep_sampler=dict(type='ContinuousTimeStepSampler', shift=2.0, logit_normal_enable=True),
         denoising_mean_mode='U'),
     diffusion_use_ema=True,
-    inference_only=True)
+    autocast_dtype='bfloat16')
 
 save_interval = 1000
 must_save_interval = 20000  # interval to save regardless of max_keep_ckpts
@@ -39,6 +42,7 @@ work_dir = 'work_dirs/' + name
 train_cfg = dict()
 test_cfg = dict(
     latent_size=(4, 32, 32),
+    single_step_cfg=True,
 )
 
 optimizer = {}
@@ -56,7 +60,7 @@ lr_config = dict()
 checkpoint_config = dict()
 
 
-guidance_scales = [0] #.47] #0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.11, 0.13, 0.16, 0.19, 0.23, 0.27, 0.33, 0.39, 0.47, 0.55, 0.65, 0.75]
+guidance_scales = [2.2, 2.4, 2.6, 2.8, 3.0]
 
 methods = dict(
     gmode2=dict(
@@ -71,7 +75,7 @@ methods = dict(
 
 evaluation = []
 
-for step, substep in [(8, 1)]:  # (8, 16)
+for step, substep in [(16, 1)]:  # (8, 16)
     for method_name, method_config in methods.items():
         for guidance_scale in guidance_scales:
             test_cfg_override = dict(
@@ -127,4 +131,4 @@ cudnn_benchmark = True
 opencv_num_threads = 0
 mp_start_method = 'fork'
 
-# python test.py configs/gmflow_imagenet_k8_test.py /workspace/GMFlow/checkpoints/sscfg_imagenet_k8_train/iter_100000.pth --gpu-ids 0
+# python test.py configs/sscfg_fm_imagenet_k8_test.py /data/single-step-cfg/checkpoints/sscfg_fm_imagenet_k8_8gpus/iter_97000.pth --gpu-ids 0
