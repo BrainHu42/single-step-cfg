@@ -26,7 +26,6 @@ model = dict(
         flow_loss=dict(
             type='DDPMMSELossMod',
             p_uncond=0.4,
-            # Let the loss compute u_t and uncond_u_t from mixture heads
             num_timesteps=1000,
             weight_scale=2.0),
         num_timesteps=1000,

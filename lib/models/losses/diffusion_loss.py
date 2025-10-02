@@ -161,7 +161,7 @@ class DDPMMSELossMod(DDPMLossMod):
                  data_info=None,
                  loss_name='loss_ddpm_mse',
                  scale_norm=False,
-                 p_uncond=0.5,
+                 p_uncond=0.0,
                  num_timesteps=1000,
                  momentum=0.001):
         super().__init__(rescale_mode=rescale_mode,
@@ -216,9 +216,8 @@ class DDPMMSELossMod(DDPMLossMod):
         unconditional u_t losses as requested; otherwise, fall back to
         vanilla MSE between ``pred`` and ``target`` from ``data_info``.
         """
-        has_gm = all(k in output_dict for k in ("means", "logweights", "logstds", "uncond_mean"))
+        has_gm = all(k in output_dict for k in ("means", "logweights", "logstds"))
         if not has_gm:
-            # CHANGED: remove 0.5; match forward's "no scaling", and rescale on return.
             loss_input_dict = {k: output_dict[v] for k, v in self.data_info.items()}
             pred = loss_input_dict.get('pred')
             target = loss_input_dict.get('target')
@@ -245,25 +244,17 @@ class DDPMMSELossMod(DDPMLossMod):
             logweights = logweights.unsqueeze(-1)
         w = torch.softmax(logweights, dim=-4)
         u_t_pred = (means * w).sum(dim=-4)  # (B,*,C,H,W)
+        u_t_tgt = output_dict["u_t"]
 
-        # target u_t = noise - x_0 (provided by GaussianFlow) or reconstruct
-        if "u_t" in output_dict:
-            u_t_tgt = output_dict["u_t"]
-        else:
-            assert all(k in output_dict for k in ("noise", "x_0")), (
-                "Need either 'u_t' or both 'noise' and 'x_0' in outputs_dict")
-            u_t_tgt = output_dict["noise"] - output_dict["x_0"]
-
-        # CHANGED: keep a raw part for logging; weight by (1 - p_uncond) only for the total.
         loss_cond_raw = self.loss_fn(pred=u_t_pred, target=u_t_tgt) * 0.5
         loss_cond = loss_cond_raw * (1.0 - self.p_uncond)
 
-        # 2) Unconditional term (if uncond_* present):
+        # 2) Unconditional term (if uncond_mean present):
         loss_uncond = None
         loss_uncond_raw = None
         mse_u_tgt_vs_uncond_tgt = None
         mse_u_pred_vs_uncond_pred = None
-        has_uncond = "uncond_mean" in output_dict # all(k in outputs_dict for k in ("uncond_means", "uncond_logweights", "uncond_logstds"))
+        has_uncond = "uncond_mean" in output_dict
         if has_uncond:
             u_uncond_pred = output_dict["uncond_mean"]
 
@@ -272,13 +263,12 @@ class DDPMMSELossMod(DDPMLossMod):
             x_t = output_dict["x_t"]
             x0_bank = output_dict["x_0"]  # (B,C,H,W) treated as candidate set
             timesteps = output_dict["timesteps"].to(x0_bank.dtype)
-            T = float(self.num_timesteps if self.num_timesteps is not None else 1000)
 
             log_probs, vector_field = compute_posterior_x0_given_xt(
                 x_t=x_t,
                 x0_bank=x0_bank,
                 timesteps=timesteps,
-                num_timesteps=T,
+                num_timesteps=self.num_timesteps,
             )  # log_probs: (B,B), vector_field: (B,B,C,H,W)
 
             probs = log_probs.softmax(dim=1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)

@@ -11,7 +11,7 @@ MAX_RETRIES=3            # How many times to retry after a non-zero exit.
 RETRY_DELAY=15            # Seconds to sleep between retries.
 
 NPROC_PER_NODE=4          # Number of GPUs for torchrun on this machine.
-CONFIG="configs/sscfg_fm_imagenet_k8_train.py"  # Your training config path.
+CONFIG="configs/fm_imagenet_k8_train.py"  # Your training config path.
 
 LOG_DIR="logs"            # Where to save logs.
 LOG_FILE="$LOG_DIR/train_$(date +%Y%m%d_%H%M%S).log"  # Unique log per run.

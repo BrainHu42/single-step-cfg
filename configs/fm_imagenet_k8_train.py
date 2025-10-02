@@ -21,11 +21,12 @@ model = dict(
             in_channels=4,
             num_layers=28,
             sample_size=32,  # 256
-            torch_dtype='bfloat16',
+            torch_dtype='float32',
             checkpointing=True),
         flow_loss=dict(
             type='DDPMMSELossMod',
-            data_info=dict(pred='means', target='u_t'),
+            p_uncond=0.0,
+            num_timesteps=1000,
             weight_scale=2.0),
         num_timesteps=1000,
         timestep_sampler=dict(type='ContinuousTimeStepSampler', shift=1.0, logit_normal_enable=True),
