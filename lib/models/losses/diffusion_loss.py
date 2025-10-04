@@ -275,10 +275,16 @@ class DDPMMSELossMod(DDPMLossMod):
             u_uncond_tgt = -1 * (probs * vector_field).sum(dim=1)  # (B,C,H,W)
 
             with torch.no_grad():
-                diff_targets = u_t_tgt - u_uncond_tgt
+                # Align targets the same way you aligned preds
+                aligned_uncond_tgt = u_uncond_tgt
+                while aligned_uncond_tgt.dim() < u_t_tgt.dim():
+                    aligned_uncond_tgt = aligned_uncond_tgt.unsqueeze(1)
+
+                diff_targets = u_t_tgt - aligned_uncond_tgt
                 aligned_uncond_pred = u_uncond_pred
                 while aligned_uncond_pred.dim() < u_t_pred.dim():
                     aligned_uncond_pred = aligned_uncond_pred.unsqueeze(1)
+
                 diff_preds = u_t_pred - aligned_uncond_pred
                 mse_u_tgt_vs_uncond_tgt = diff_targets.square().mean()
                 mse_u_pred_vs_uncond_pred = diff_preds.square().mean()
