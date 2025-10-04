@@ -1,5 +1,5 @@
 # 512 samples per gpu, requires 40GB VRAM
-name = 'sscfg_fm_imagenet_k8_8gpus'
+name = 'sscfg_fm_imagenet_k8_train'
 
 model = dict(
     type='LatentDiffusionClassImage',
@@ -21,7 +21,7 @@ model = dict(
             in_channels=4,
             num_layers=28,
             sample_size=32,  # 256
-            torch_dtype='float32',
+            torch_dtype='bfloat16',
             checkpointing=True),
         flow_loss=dict(
             type='DDPMMSELossMod',
@@ -29,7 +29,7 @@ model = dict(
             num_timesteps=1000,
             weight_scale=2.0),
         num_timesteps=1000,
-        timestep_sampler=dict(type='ContinuousTimeStepSampler', shift=1.0, logit_normal_enable=True),
+        timestep_sampler=dict(type='ContinuousTimeStepSampler', shift=3.0, logit_normal_enable=True),
         denoising_mean_mode='U'),
     diffusion_use_ema=True,
     autocast_dtype='bfloat16')
@@ -38,14 +38,14 @@ save_interval = 1000
 must_save_interval = 20000  # interval to save regardless of max_keep_ckpts
 eval_interval = 20000
 work_dir = 'work_dirs/' + name
-total_iters = 100_000
+total_iters = 200_000
 
 train_cfg = dict(
-    trans_ratio=0.5,
+    # trans_ratio=0.5,
     prob_class=1.0,
     diffusion_grad_clip=10.0,
     diffusion_grad_clip_begin_iter=1000,
-    grad_accum_steps=2,
+    grad_accum_steps=1,
 )
 test_cfg = dict(
     latent_size=(4, 32, 32),
@@ -63,9 +63,10 @@ data = dict(
     workers_per_gpu=4,
     train=dict(
         type='ImageNet',
-        data_root='data/imagenet/train_cache',
-        datalist_path='data/imagenet/train_cache.txt'),
-    train_dataloader=dict(samples_per_gpu=256),
+        data_root='/data/imagenet/train_cache',
+        label2name_path='/data/imagenet/imagenet1000_clsidx_to_labels.txt',
+        datalist_path='/data/imagenet/train_cache.txt'),
+    train_dataloader=dict(samples_per_gpu=1024),
     val=dict(
         type='ImageNet',
         test_mode=True),

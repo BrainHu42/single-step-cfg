@@ -1,4 +1,4 @@
-name = 'sscfg_fm_imagenet_k8_test'
+name = 'fm_imagenet_k8_test'
 
 model = dict(
     type='LatentDiffusionClassImage',
@@ -6,11 +6,11 @@ model = dict(
         type='PretrainedVAE',
         from_pretrained='stabilityai/sd-vae-ft-ema',
         freeze=True,
-        torch_dtype='float16'),
+        torch_dtype='bfloat16'),
     diffusion=dict(
         type='GaussianFlow',
         denoising=dict(
-            type='GMDiTTransformer2DModel_Uncond',
+            type='GMDiTTransformer2DModel',
             num_gaussians=1,
             constant_logstd=0.0,
             logstd_inner_dim=1024,
@@ -20,19 +20,12 @@ model = dict(
             in_channels=4,
             num_layers=28,
             sample_size=32,  # 256
-            torch_dtype='bfloat16',
-            checkpointing=True),
-        # flow_loss=dict(
-        #     type='DDPMMSELossMod',
-        #     p_uncond=0.4,
-        #     # Let the loss compute u_t and uncond_u_t from mixture heads
-        #     num_timesteps=1000,
-        #     weight_scale=2.0),
+            torch_dtype='bfloat16'),
         num_timesteps=1000,
         timestep_sampler=dict(type='ContinuousTimeStepSampler', shift=1.0, logit_normal_enable=True),
         denoising_mean_mode='U'),
     diffusion_use_ema=True,
-    autocast_dtype='bfloat16')
+    inference_only=True)
 
 save_interval = 1000
 must_save_interval = 20000  # interval to save regardless of max_keep_ckpts
@@ -42,7 +35,6 @@ work_dir = 'work_dirs/' + name
 train_cfg = dict()
 test_cfg = dict(
     latent_size=(4, 32, 32),
-    single_step_cfg=True,
 )
 
 optimizer = {}
@@ -134,4 +126,4 @@ cudnn_benchmark = True
 opencv_num_threads = 0
 mp_start_method = 'fork'
 
-# python test.py configs/sscfg_fm_imagenet_k8_test.py ./checkpoints/sscfg_fm_imagenet_k8_train/iter_120000.pth --gpu-ids 0
+# python test.py configs/fm_imagenet_k8_test.py /workspace/checkpoints/fm_imagenet_k8_train/iter_90000.pth --gpu-ids 0

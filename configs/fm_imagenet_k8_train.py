@@ -1,5 +1,5 @@
 # 512 samples per gpu, requires 40GB VRAM
-name = 'fm_imagenet_k8_8gpus'
+name = 'fm_imagenet_k8_train'
 
 model = dict(
     type='LatentDiffusionClassImage',
@@ -45,7 +45,7 @@ train_cfg = dict(
     prob_class=0.9,
     diffusion_grad_clip=10.0,
     diffusion_grad_clip_begin_iter=1000,
-    grad_accum_steps=2,
+    grad_accum_steps=1, # 2,
 )
 test_cfg = dict(
     latent_size=(4, 32, 32),
@@ -63,9 +63,10 @@ data = dict(
     workers_per_gpu=4,
     train=dict(
         type='ImageNet',
-        data_root='data/imagenet/train_cache',
-        datalist_path='data/imagenet/train_cache.txt'),
-    train_dataloader=dict(samples_per_gpu=128),
+        data_root='/data/imagenet/train_cache',
+        label2name_path='/data/imagenet/imagenet1000_clsidx_to_labels.txt',
+        datalist_path='/data/imagenet/train_cache.txt'), # 'data/imagenet/train_cache.txt'),
+    train_dataloader=dict(samples_per_gpu=1024),
     val=dict(
         type='ImageNet',
         test_mode=True),
@@ -146,7 +147,7 @@ runner = dict(
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
 load_from = None
-resume_from = f'checkpoints/{name}/latest.pth'  # resume by default
+resume_from = f'/workspace/checkpoints/{name}/latest.pth'  # resume by default
 workflow = [('train', save_interval)]
 use_ddp_wrapper = True
 find_unused_parameters = False

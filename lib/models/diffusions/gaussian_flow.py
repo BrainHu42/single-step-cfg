@@ -20,7 +20,7 @@ from lib.models.losses import DDPMMSELossMod
 
 @torch.jit.script
 def guidance_jit(pos_mean, neg_mean, guidance_scale: float, orthogonal: bool = False):
-    bias = (pos_mean - neg_mean) * (guidance_scale)
+    bias = (pos_mean - neg_mean) * (guidance_scale - 1)
     if orthogonal:
         bias = bias - (bias * pos_mean).mean(
             dim=(-3, -2, -1), keepdim=True
@@ -134,6 +134,86 @@ class GaussianFlow(nn.Module):
 
         return loss, log_vars
 
+    # def forward_test(
+    #         self, x_0=None, noise=None, guidance_scale=1.0,
+    #         test_cfg_override=dict(), show_pbar=False, **kwargs):
+    #     x_t = torch.randn_like(x_0) if noise is None else noise
+    #     ori_dtype = x_t.dtype
+    #     x_t = x_t.float()
+
+    #     cfg = deepcopy(self.test_cfg)
+    #     cfg.update(test_cfg_override)
+
+    #     output_mode = cfg.get('output_mode', 'mean')
+    #     assert output_mode in ['mean', 'sample']
+
+    #     sampler = cfg.get('sampler', 'FlowMatchEulerDiscrete')
+    #     sampler_class = getattr(diffusers.schedulers, sampler + 'Scheduler', None)
+    #     if sampler_class is None:
+    #         sampler_class = getattr(schedulers, sampler + 'Scheduler', None)
+    #     if sampler_class is None:
+    #         raise AttributeError(f'Cannot find sampler [{sampler}].')
+
+    #     sampler_kwargs = cfg.get('sampler_kwargs', {})
+    #     signatures = inspect.signature(sampler_class).parameters.keys()
+    #     if 'shift' in signatures and 'shift' not in sampler_kwargs:
+    #         sampler_kwargs['shift'] = cfg.get('shift', self.timestep_sampler.shift)
+    #     if 'output_mode' in signatures:
+    #         sampler_kwargs['output_mode'] = output_mode
+    #     sampler = sampler_class(self.num_timesteps, **sampler_kwargs)
+
+    #     sampler.set_timesteps(cfg.get('num_timesteps', self.num_timesteps), device=x_t.device)
+    #     orthogonal_guidance = cfg.get('orthogonal_guidance', False)
+    #     timesteps = sampler.timesteps
+    #     use_guidance = guidance_scale > 1.0
+    #     num_batches = x_t.size(0)
+
+    #     if show_pbar:
+    #         pbar = mmcv.ProgressBar(len(timesteps))
+
+    #     for t in timesteps:
+    #         x_t_input = x_t
+    #         if use_guidance:
+    #             x_t_input = torch.cat([x_t_input, x_t_input], dim=0)
+
+    #         denoising_output = self.pred(x_t_input, t, **kwargs)
+
+    #         if isinstance(denoising_output, dict):  # for gmflow compatibility
+    #             if use_guidance:
+    #                 gm_pos = {k: v[num_batches:] for k, v in denoising_output.items()}
+    #                 gm_neg = {k: v[:num_batches] for k, v in denoising_output.items()}
+                    
+    #                 diff = gm_to_mean(gm_pos) - gm_to_mean(gm_neg)
+    #                 print(diff.square().mean(), flush=True)
+                    
+    #                 bias = guidance_jit(gm_to_mean(gm_pos), gm_to_mean(gm_neg), guidance_scale, orthogonal_guidance)
+    #                 denoising_output = dict(
+    #                     means=gm_pos['means'] + bias.unsqueeze(-4),
+    #                     logstds=gm_pos['logstds'],
+    #                     logweights=gm_pos['logweights'])
+
+    #             if output_mode == 'mean':
+    #                 denoising_output = gm_to_mean(denoising_output)
+    #             else:
+    #                 denoising_output = gm_to_sample(denoising_output).squeeze(-4)
+
+    #         else:
+    #             assert output_mode == 'mean'
+    #             if use_guidance:
+    #                 mean_neg, mean_pos = denoising_output.chunk(2, dim=0)
+    #                 bias = guidance_jit(mean_pos, mean_neg, guidance_scale, orthogonal_guidance)
+    #                 denoising_output = mean_pos + bias
+
+    #         x_t = sampler.step(denoising_output, t, x_t, return_dict=False)[0]
+    #         if show_pbar:
+    #             pbar.update()
+
+    #     if show_pbar:
+    #         sys.stdout.write('\n')
+
+    #     return x_t.to(ori_dtype)
+
+
     def forward_test(
             self, x_0=None, noise=None, guidance_scale=1.0,
             test_cfg_override=dict(), show_pbar=False, **kwargs):
@@ -165,7 +245,7 @@ class GaussianFlow(nn.Module):
         sampler.set_timesteps(cfg.get('num_timesteps', self.num_timesteps), device=x_t.device)
         orthogonal_guidance = cfg.get('orthogonal_guidance', False)
         timesteps = sampler.timesteps
-        use_guidance = guidance_scale > 0.0
+        use_guidance = guidance_scale > 1.0
         num_batches = x_t.size(0)
 
         if show_pbar:
@@ -173,8 +253,6 @@ class GaussianFlow(nn.Module):
 
         for t in timesteps:
             x_t_input = x_t
-            # if use_guidance:
-            #     x_t_input = torch.cat([x_t_input, x_t_input], dim=0)
 
             denoising_output = self.pred(x_t_input, t, **kwargs)
 
@@ -184,7 +262,7 @@ class GaussianFlow(nn.Module):
                     gm_cond = denoising_output
                     
                     diff = gm_to_mean(gm_cond) - uncond_mean
-                    print(torch.abs(diff).mean())
+                    print(diff.square().mean())
                     
                     bias = guidance_jit(gm_to_mean(gm_cond), uncond_mean, guidance_scale, orthogonal_guidance)
                     denoising_output = dict(
@@ -212,6 +290,8 @@ class GaussianFlow(nn.Module):
             sys.stdout.write('\n')
 
         return x_t.to(ori_dtype)
+
+
 
     def forward(self, x_0=None, return_loss=False, **kwargs):
         if return_loss:
